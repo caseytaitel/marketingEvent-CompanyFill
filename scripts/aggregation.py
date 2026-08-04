@@ -16,21 +16,17 @@ Properties these rules ultimately feed (all on the Company object):
                                             directly in HubSpot, not by this
                                             script. Blank != No.)
 
-Source of truth for the event -> tier mapping below: the finalized mapping
-worked out in chat (marketing_event_tier_mapping.csv). If new event lists are
-added later, add a row here — this table is not read from the CSV at runtime,
-it's the single source of truth going forward.
-
-Excluded from EVENT_LISTS entirely (confirmed in chat, not events / not
-confirmed-attendee lists):
-  - 461  Intezer AI SOC Live — Companies (pre-reg, use Contacts list instead)
-  - 466  CISOExecNet - 2026 - Full Member List (membership roster, not an event)
-  - 852  Gartner Security Summit — Companies (pre-reg, use Contacts list instead)
+Source of truth for the event -> tier mapping: input/marketingEventsRegistry.csv
+(Folder / Sub-folder / List Name / List ID / Tier / Role / Notes). EVENT_LISTS is
+loaded from that CSV at import time. Rows with Role=excluded are validated then
+dropped (e.g. 461 / 852 pre-reg company lists).
 """
 
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 class AggregationError(RuntimeError):
@@ -74,10 +70,12 @@ EXCLUDED_COMPANY_DOMAINS = {"realm.security"}
 COUNT_HIGH_ENGAGEMENT_AS_ATTENDANCE = True
 
 # ---------------------------------------------------------------------------
-# Event list -> tier mapping (source of truth — see module docstring)
+# Event list -> tier mapping (loaded from registry CSV)
 #
 # Fields: (list_id, folder, canonical_event, tier, role)
-#   tier: "Channel" | "General" | None (None only valid when role="high_engagement")
+#   tier: "Channel" | "General" | None
+#         None is required (blank in CSV) for high_engagement / excluded rows;
+#         high_engagement tiers are derived via derive_high_engagement_tiers()
 #   role: "event_count"      -> counts toward distinct_marketing_events_attended
 #                                and contributes to marketing_event_type
 #         "high_engagement"  -> seeds high_engagement_event_attendee = Yes.
@@ -85,56 +83,111 @@ COUNT_HIGH_ENGAGEMENT_AS_ATTENDANCE = True
 #                                COUNT_HIGH_ENGAGEMENT_AS_ATTENDANCE is on, and
 #                                takes its Channel/General tier from the paired
 #                                event_count row for the same event name.
-#                                (These lists were originally assumed to be
-#                                sub-lists of an event_count row above, so they
-#                                counted for nothing on their own — the live data
-#                                disproved that. See the flag for the numbers.)
+#         "excluded"         -> validated at load, then dropped from EVENT_LISTS
 # ---------------------------------------------------------------------------
 
-EVENT_LISTS: list[tuple[int, str, str, str | None, str]] = [
-    (1310, "Channel Partner Events", "Crush Security ATL Jul 2026", "Channel", "event_count"),
-    (1034, "Channel Partner Events", "Crush Security TX Jun 2026", "Channel", "event_count"),
-    (969, "Channel Partner Events", "Crush Security AZ Jun 2026", "Channel", "event_count"),
-    (930, "Channel Partner Events", "Evotek Las Vegas Knights", "Channel", "event_count"),
-    (726, "Channel Partner Events", "Evotek Apr 2026", "Channel", "event_count"),
-    (1042, "Channel Partner Events", "GuidePoint Tigers vs Yankees Jun 2026", "Channel", "event_count"),
-    (863, "Channel Partner Events", "Intezer AI SOC Live Apr 2026", "Channel", "event_count"),
-    (1128, "Channel Partner Events", "CyberOne TAO Dinner Chicago Jul 2026", "Channel", "event_count"),
-    (984, "CISO Society", "CISO Society Houston Jun 2026", "General", "event_count"),
-    (932, "CISO Society", "CISO Society Denver May 2026", "General", "event_count"),
-    (857, "CISOExecNet", "CISOExecNet Mid-West", "General", "event_count"),
-    (802, "CISOExecNet", "CISOExecNet New England", "General", "event_count"),
-    (724, "CISOExecNet", "CISOExecNet Austin", "General", "event_count"),
-    (120, "CISOExecNet", "CISOExecNet Virtual Dec 2025", "General", "event_count"),
-    (809, "CISOExecNet", "CISOExecNet Pittsburgh", "General", "event_count"),
-    (636, "CyAlliance", "CyAlliance RSA", "General", "event_count"),
-    (481, "CyAlliance", "CyAlliance Atlanta", "General", "event_count"),
-    (369, "CyAlliance", "CyAlliance Austin", "General", "event_count"),
-    (362, "CyAlliance", "CyAlliance Dallas", "General", "event_count"),
-    (321, "CyAlliance", "CyAlliance Virtual Feb 2026", "General", "event_count"),
-    (151, "CyAlliance", "CyAlliance Virtual Jan 2026", "General", "event_count"),
-    (107, "Cybersecurity Summit", "Cybersecurity Summit NYC Nov 2025", "General", "event_count"),
-    (104, "Cybersecurity Summit", "Cybersecurity Summit NYC Nov 2025", None, "high_engagement"),
-    (78, "Cybersecurity Summit", "Cybersecurity Summit Boston Oct 2025", "General", "event_count"),
-    (73, "Cybersecurity Summit", "Cybersecurity Summit Boston Oct 2025", None, "high_engagement"),
-    (890, "IANS", "IANS Minneapolis May 2026", "General", "event_count"),
-    (892, "IANS", "IANS Minneapolis May 2026", None, "high_engagement"),
-    (891, "IANS", "IANS Minneapolis May 2026", None, "high_engagement"),
-    (911, "IANS", "IANS Philadelphia May 2026", "General", "event_count"),
-    (914, "IANS", "IANS Philadelphia May 2026", None, "high_engagement"),
-    (912, "IANS", "IANS Philadelphia May 2026", None, "high_engagement"),
-    (962, "Trade Shows", "Gartner Security Summit Jun 2026", "General", "event_count"),
-    (1304, "Trade Shows", "Blackhat / CyberOne Aug 2026", "Channel", "event_count"),  # OVERRIDE: folder says Trade Shows, counted as Channel per confirmation
-    (117, "Trade Shows", "FutureCon Boston Nov 2025", "General", "event_count"),
-    (113, "Trade Shows", "FutureCon Boston Nov 2025", None, "high_engagement"),
-    (640, "Trade Shows", "RSAC Mar 2026", "General", "event_count"),
-    (1127, "CISO XC", "CISO XC Chicago Jul 2026", "General", "event_count"),
-    (94, "CISO XC", "CISO XC ATL", "General", "event_count"),
-    (889, "Unclassified", "SecureWorld Top Golf Philly May 2026", "General", "event_count"),
-    (937, "Unclassified", "7AI Boston Tech Week May 2026", "General", "event_count"),
-    (973, "Unclassified", "Secure the Dish Jun 2026", "General", "event_count"),
-    (63, "Unclassified", "CISO Dinner Oct 2025", "General", "event_count"),
-]
+_VALID_ROLES = frozenset({"event_count", "high_engagement", "excluded"})
+_VALID_TIERS = frozenset({"Channel", "General"})
+_REGISTRY_CSV = (
+    Path(__file__).resolve().parent.parent / "input" / "marketingEventsRegistry.csv"
+)
+
+
+def _canonical_event(list_name: str) -> str:
+    """Strip the trailing ' - [List Type]' segment from a registry List Name.
+
+    Splits on the literal ' - ' (space-dash-space) only, so names like
+    CyAlliance's 'In-Person Event' keep their unspaced hyphen intact.
+    """
+    parts = list_name.split(" - ")
+    if len(parts) < 2:
+        raise AggregationError(
+            f"List Name {list_name!r} has no trailing ' - [List Type]' segment "
+            f"to strip (need at least one ' - ' separator)."
+        )
+    return " - ".join(parts[:-1])
+
+
+def load_event_lists(
+    csv_path: str | Path,
+) -> list[tuple[int, str, str, str | None, str]]:
+    """Load EVENT_LISTS from the marketing-events registry CSV.
+
+    Returns (list_id, folder, canonical_event, tier, role) for every non-excluded
+    row. Role=excluded rows are validated then omitted.
+    """
+    path = Path(csv_path)
+    seen_ids: set[int] = set()
+    loaded: list[tuple[int, str, str, str | None, str]] = []
+
+    with path.open(encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        required = {"Folder", "Sub-folder", "List Name", "List ID", "Tier", "Role", "Notes"}
+        if reader.fieldnames is None or not required.issubset(set(reader.fieldnames)):
+            raise AggregationError(
+                f"Registry CSV {path} missing required columns; got {reader.fieldnames!r}, "
+                f"need at least {sorted(required)}"
+            )
+
+        for row_num, row in enumerate(reader, start=2):
+            raw_id = (row.get("List ID") or "").strip()
+            try:
+                list_id = int(raw_id)
+            except ValueError as exc:
+                raise AggregationError(
+                    f"Registry CSV {path} row {row_num}: List ID {raw_id!r} is not an int"
+                ) from exc
+            if list_id in seen_ids:
+                raise AggregationError(
+                    f"Registry CSV {path} row {row_num}: duplicate List ID {list_id}"
+                )
+            seen_ids.add(list_id)
+
+            role = (row.get("Role") or "").strip()
+            if role not in _VALID_ROLES:
+                raise AggregationError(
+                    f"Registry CSV {path} row {row_num} (List ID {list_id}): "
+                    f"Role must be one of {sorted(_VALID_ROLES)}, got {role!r}"
+                )
+
+            tier_raw = (row.get("Tier") or "").strip()
+            if role == "event_count":
+                if tier_raw not in _VALID_TIERS:
+                    raise AggregationError(
+                        f"Registry CSV {path} row {row_num} (List ID {list_id}): "
+                        f"event_count rows require Tier Channel or General, got {tier_raw!r}"
+                    )
+                tier: str | None = tier_raw
+            else:
+                # high_engagement / excluded — tier must be blank; HE tiers are
+                # derived from the paired event_count row, never stated here.
+                if tier_raw:
+                    raise AggregationError(
+                        f"Registry CSV {path} row {row_num} (List ID {list_id}): "
+                        f"Role={role} rows must have blank Tier "
+                        f"(derived later for high_engagement), got {tier_raw!r}"
+                    )
+                tier = None
+
+            if role == "excluded":
+                continue
+
+            folder = row.get("Folder") or ""
+            list_name = row.get("List Name") or ""
+            if not list_name.strip():
+                raise AggregationError(
+                    f"Registry CSV {path} row {row_num} (List ID {list_id}): empty List Name"
+                )
+            loaded.append(
+                (list_id, folder, _canonical_event(list_name), tier, role)
+            )
+
+    return loaded
+
+
+EVENT_LISTS: list[tuple[int, str, str, str | None, str]] = load_event_lists(
+    _REGISTRY_CSV
+)
 
 
 # ---------------------------------------------------------------------------
@@ -247,5 +300,40 @@ def aggregate(
                     # list and the booth-scan list still counts the event once.
                     agg.events_attended.add(event_name)
                     agg.tiers.add(he_tiers[event_name])
+
+    return aggregates
+
+
+@dataclass
+class ContactAggregate:
+    contact_id: str
+    events_attended: set[str] = field(default_factory=set)
+    high_engagement_events: set[str] = field(default_factory=set)
+
+
+def aggregate_contacts(list_members: dict[int, list[str]]) -> dict[str, ContactAggregate]:
+    """Roll per-list contact membership up to per-contact aggregates.
+
+    Unlike aggregate(), this needs no contact->company mapping (the contact IS
+    the row) and tracks no tier — Channel/General is a company-level property
+    only, so there's nothing here for derive_high_engagement_tiers() to feed.
+
+    list_members : {list_id: [contact_id, ...]} for every list in EVENT_LISTS.
+    Indexes list_members strictly (not .get), same rationale as aggregate():
+    a missing list should be a loud KeyError, not a silent no-op.
+    """
+    aggregates: dict[str, ContactAggregate] = {}
+    for list_id, _folder, event_name, _tier, role in EVENT_LISTS:
+        for contact_id in list_members[list_id]:
+            agg = aggregates.setdefault(contact_id, ContactAggregate(contact_id))
+            if role == "event_count":
+                agg.events_attended.add(event_name)
+            elif role == "high_engagement":
+                agg.high_engagement_events.add(event_name)
+                if COUNT_HIGH_ENGAGEMENT_AS_ATTENDANCE:
+                    # Same no-double-counting property as aggregate(): a
+                    # contact on both the attendee list and the booth-scan
+                    # list for the same event still counts it once.
+                    agg.events_attended.add(event_name)
 
     return aggregates
