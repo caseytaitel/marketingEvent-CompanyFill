@@ -149,7 +149,9 @@ HubSpot lists
 **Add a new event list** — append a row to `EVENT_LISTS` in `aggregation.py`.
 Do not invent a tier; if it's a high-engagement / booth-scan list, pair it with
 an `event_count` row for the same canonical event name (tier is derived from
-that pair).
+that pair). Lists created going forward should be tagged with the real event
+date at creation time; this approximation only applies to the historical
+backfill period.
 
 **Change booth-scan behaviour** — flip `COUNT_HIGH_ENGAGEMENT_AS_ATTENDANCE` in
 `aggregation.py` (documented there with the measured overlap numbers).

@@ -49,15 +49,17 @@ def write_csv(aggregates: dict[str, CompanyAggregate], companies: dict[str, dict
                     "company_domain": props.get("domain", ""),
                     # NOTE: HubSpot CSV import expects multi-checkbox values
                     # semicolon-delimited in one cell. Verify against the
-                    # import preview screen before importing.
-                    "marketing_event_type": ";".join(sorted(agg.tiers)),
+                    # import preview screen before importing. Review CSV uses
+                    # "; " (semicolon + space) for readability; strip on split
+                    # if you re-parse these columns.
+                    "marketing_event_type": "; ".join(sorted(agg.tiers)),
                     "distinct_marketing_events_attended": len(agg.events_attended),
-                    "events_attended": ";".join(sorted(agg.events_attended)),
+                    "events_attended": "; ".join(sorted(agg.events_attended)),
                     # Blank, not "No" — blank means not-yet-assessed. Only the
                     # 7 shortcut lists seed a "Yes" here; everything else is
                     # Ops's manual call made directly in HubSpot.
                     "high_engagement_event_attendee": "Yes" if agg.high_engagement_events else "",
-                    "high_engagement_source_events": ";".join(sorted(agg.high_engagement_events)),
+                    "high_engagement_source_events": "; ".join(sorted(agg.high_engagement_events)),
                 }
             )
             written += 1

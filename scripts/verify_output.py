@@ -207,9 +207,9 @@ def check_company(
         client, company_id, members_by_list, primary_type_id
     )
 
-    csv_events = set(filter(None, row["events_attended"].split(";")))
-    csv_he = set(filter(None, row["high_engagement_source_events"].split(";")))
-    csv_tiers = set(filter(None, row["marketing_event_type"].split(";")))
+    csv_events = {p.strip() for p in row["events_attended"].split(";") if p.strip()}
+    csv_he = {p.strip() for p in row["high_engagement_source_events"].split(";") if p.strip()}
+    csv_tiers = {p.strip() for p in row["marketing_event_type"].split(";") if p.strip()}
     expected_he_flag = "Yes" if high_engagement else ""
 
     check = CompanyCheck(

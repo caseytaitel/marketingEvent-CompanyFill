@@ -69,17 +69,22 @@ class HubSpotError(RuntimeError):
 
 
 def load_env_files() -> None:
-    for name in (".env.local", ".env"):
-        path = Path(__file__).resolve().parent / name
-        if not path.exists():
-            continue
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
+    # Prefer the repo root (parent of scripts/), then scripts/ itself — after
+    # the move into scripts/, credentials stayed at the project root.
+    script_dir = Path(__file__).resolve().parent
+    search_dirs = (script_dir.parent, script_dir)
+    for directory in search_dirs:
+        for name in (".env.local", ".env"):
+            path = directory / name
+            if not path.exists():
                 continue
-            key, _, value = line.partition("=")
-            key, value = key.strip(), value.strip().strip('"').strip("'")
-            os.environ.setdefault(key, value)
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key, value = key.strip(), value.strip().strip('"').strip("'")
+                os.environ.setdefault(key, value)
 
 
 def require_token() -> str:
