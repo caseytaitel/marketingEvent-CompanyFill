@@ -257,6 +257,31 @@ def derive_high_engagement_tiers() -> dict[str, str]:
     return resolved
 
 
+def event_tier_lookup() -> dict[str, str]:
+    """Flat canonical_event -> tier map covering every event this portal has run.
+
+    Used by ongoing_events/, which reads Ops-maintained contact properties rather
+    than List membership. It needs to answer exactly one question — "what tier is
+    this event name?" — with no notion of List ID or Role, so both registry roles
+    are merged into a single flat map here.
+
+    The event_count/high_engagement Role distinction is BACKFILL-ONLY: it existed
+    because Lists were the only data source for the backfill period. Going forward
+    Ops maintains high engagement directly on the contact, so an event is just an
+    event and the only thing that varies is its Channel/General tier.
+
+    Deliberately requires no registry schema change — the merge below works
+    against marketingEventsRegistry.csv exactly as it exists today.
+    """
+    lookup = {
+        name: tier
+        for _id, _f, name, tier, role in EVENT_LISTS
+        if role == "event_count" and tier
+    }
+    lookup.update(derive_high_engagement_tiers())
+    return lookup
+
+
 def aggregate(
     list_members: dict[int, list[str]], contact_to_company: dict[str, str]
 ) -> dict[str, CompanyAggregate]:

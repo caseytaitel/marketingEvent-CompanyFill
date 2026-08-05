@@ -26,9 +26,19 @@ import sys
 from datetime import date
 from pathlib import Path
 
-from aggregation import EVENT_LISTS, AggregationError, aggregate_contacts
-from hubspot_client import HubSpotClient, HubSpotError, require_token
-from output import write_contact_csv
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from shared.aggregation import (  # noqa: E402
+    EVENT_LISTS,
+    AggregationError,
+    aggregate_contacts,
+)
+from shared.hubspot_client import (  # noqa: E402
+    HubSpotClient,
+    HubSpotError,
+    require_token,
+)
+from shared.output import write_contact_csv  # noqa: E402
 
 
 def fetch_list_members(client: HubSpotClient) -> dict[int, list[str]]:

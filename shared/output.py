@@ -11,7 +11,7 @@ import csv
 from dataclasses import dataclass
 from pathlib import Path
 
-from aggregation import EXCLUDED_COMPANY_DOMAINS, CompanyAggregate, ContactAggregate
+from .aggregation import EXCLUDED_COMPANY_DOMAINS, CompanyAggregate, ContactAggregate
 
 
 def write_csv(aggregates: dict[str, CompanyAggregate], companies: dict[str, dict], out_path: Path) -> None:

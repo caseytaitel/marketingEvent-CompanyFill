@@ -29,11 +29,23 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
-from aggregation import EVENT_LISTS, AggregationError, CompanyAggregate, aggregate
-from hubspot_client import HubSpotClient, HubSpotError, require_token
-from output import write_csv
-from report_missing_primary import emit_missing_primary_report
-from verify_output import load_csv_rows, print_results, verify
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from shared.aggregation import (  # noqa: E402
+    EVENT_LISTS,
+    AggregationError,
+    CompanyAggregate,
+    aggregate,
+)
+from shared.hubspot_client import (  # noqa: E402
+    HubSpotClient,
+    HubSpotError,
+    require_token,
+)
+from shared.output import write_csv  # noqa: E402
+
+from report_missing_primary import emit_missing_primary_report  # noqa: E402
+from verify_output import load_csv_rows, print_results, verify  # noqa: E402
 
 
 @dataclass
@@ -137,7 +149,7 @@ def main() -> int:
     companies = client.batch_read_companies(list(aggregates.keys()), ["name", "domain"])
 
     out_dir = Path(__file__).resolve().parent / "output" / date.today().isoformat()
-    out_path = out_dir / "marketing_event_backfill.csv"
+    out_path = out_dir / "marketing_event_company_fill.csv"
     write_csv(aggregates, companies, out_path)
 
     print_summary(aggregates)

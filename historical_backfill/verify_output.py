@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent verification of marketing_event_backfill.csv.
+"""Independent verification of marketing_event_company_fill.csv.
 
 Re-derives company->event facts straight from the API by a DIFFERENT route than
 the backfill: company -> associated contacts -> list membership, instead of
@@ -26,8 +26,14 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from aggregation import EVENT_LISTS
-from hubspot_client import HubSpotClient, HubSpotError, require_token
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from shared.aggregation import EVENT_LISTS  # noqa: E402
+from shared.hubspot_client import (  # noqa: E402
+    HubSpotClient,
+    HubSpotError,
+    require_token,
+)
 
 # Optional manual spot-check targets. When non-empty, these company IDs are
 # added on top of the automatic criteria-based sample (not instead of it).
@@ -99,11 +105,11 @@ class VerificationResults:
 
 
 def find_latest_csv() -> Path:
-    candidates = sorted(Path("output").glob("*/marketing_event_backfill.csv"))
+    candidates = sorted(Path("output").glob("*/marketing_event_company_fill.csv"))
     if not candidates:
         raise HubSpotError(
-            "No output/*/marketing_event_backfill.csv found — run "
-            "marketingEventFill.py first."
+            "No output/*/marketing_event_company_fill.csv found — run "
+            "marketingEvent-CompanyFill.py first."
         )
     return candidates[-1]
 

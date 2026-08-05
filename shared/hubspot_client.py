@@ -18,6 +18,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -58,9 +59,46 @@ NO_ASSOCIATIONS_SUBCATEGORY = "crm.associations.NO_ASSOCIATIONS_FOUND"
 COMPANY_BATCH_LIMIT = 100
 ASSOCIATIONS_BATCH_LIMIT = 1000
 
+# Contact properties Ops maintains by hand. Internal names confirmed against the
+# live portal 2026-08-04: events_attended is a string/textarea,
+# high_engagement_attendee is an enumeration with options Yes / No.
+CONTACT_EVENTS_PROPERTY = "events_attended"
+CONTACT_HIGH_ENGAGEMENT_PROPERTY = "high_engagement_attendee"
+
+# The contact property that actually tracks record-level modification in this
+# portal. See search_contacts_modified_since() — hs_lastmodifieddate is empty on
+# contacts here and silently matches nothing.
+CONTACT_MODIFIED_PROPERTY = "lastmodifieddate"
+
+# The three company properties this project maintains. Internal names and value
+# shapes confirmed against the live portal 2026-08-04:
+#   marketing_event_type                enumeration/checkbox, options
+#                                       "Channel Event Attendee" and
+#                                       "General Marketing Event Attendee",
+#                                       stored ";"-delimited with no space
+#   distinct_marketing_events_attended  number
+#   high_engagement_event_attendee      enumeration/select, options true / false
+COMPANY_EVENT_PROPERTIES = [
+    "marketing_event_type",
+    "distinct_marketing_events_attended",
+    "high_engagement_event_attendee",
+]
+
+SEARCH_PAGE_LIMIT = 100
+# HubSpot's search API refuses to page beyond 10k results. Treated as a hard
+# tripwire rather than a truncation point.
+SEARCH_RESULT_CEILING = 10000
+
 
 class HubSpotError(RuntimeError):
     pass
+
+
+def _iso_utc(value: datetime) -> str:
+    """Format a datetime as the UTC ISO-8601 string HubSpot search expects."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +290,189 @@ class HubSpotClient:
                 file=sys.stderr,
             )
         return contact_ids
+
+    # -- contact search (ongoing_events/) --------------------------------
+    def search_contacts_modified_since(
+        self,
+        cutoff_date: datetime | None,
+        until_date: datetime | None = None,
+    ) -> list[str]:
+        """Contact IDs carrying event data, optionally bounded by modified date.
+
+        VERIFIED 2026-08-04 against the live portal, and the verification changed
+        the implementation. The property to filter on is `lastmodifieddate`, NOT
+        `hs_lastmodifieddate`:
+
+            hs_lastmodifieddate  -> None on every contact sampled; a GTE search
+                                    returns total=0 for every cutoff tried, out
+                                    to 10 years. It is not populated on the
+                                    contact object in this portal.
+            lastmodifieddate     -> populated, and GTE returns sane, monotonic
+                                    totals (now-1d: 3052, now-7d: 8469,
+                                    now-30d: 38227, all-time: 39625).
+
+        Filtering on hs_lastmodifieddate would therefore have silently selected
+        ZERO companies for reprocessing on every incremental run — a no-op script
+        that looks like a clean run. That is the exact failure mode this project
+        keeps guarding against, so the property name is not a detail to gloss.
+
+        It is still record-level, not property-level: any change to a contact
+        (email open, form fill, owner change) bumps it, so a date window selects
+        more contacts than "contacts whose events_attended changed". That is
+        acceptable and intended — a wider company set just gets recomputed from
+        scratch, and recomputation is idempotent.
+
+        Every query is AND-ed with "carries event data at all", which bounds the
+        blast radius to the ~2.6k event contacts instead of the ~39.6k contact
+        database. Carrying event data means a non-empty events_attended OR
+        high_engagement_attendee=Yes; the second disjunct matters because Ops can
+        flag a booth scan as high-engagement without naming an event, and
+        dropping those would undercount high engagement at the company level.
+
+        cutoff_date=None (--all-time) means "every contact with event data",
+        never "every contact in the portal".
+        """
+        filters_common: list[dict[str, Any]] = []
+        if cutoff_date is not None:
+            filters_common.append(
+                {
+                    "propertyName": CONTACT_MODIFIED_PROPERTY,
+                    "operator": "GTE",
+                    "value": _iso_utc(cutoff_date),
+                }
+            )
+        if until_date is not None:
+            filters_common.append(
+                {
+                    "propertyName": CONTACT_MODIFIED_PROPERTY,
+                    "operator": "LTE",
+                    "value": _iso_utc(until_date),
+                }
+            )
+
+        # Separate filterGroups are OR-ed by HubSpot; filters inside one group
+        # are AND-ed. So this reads: (has events_attended AND in window) OR
+        # (high_engagement_attendee=Yes AND in window).
+        filter_groups = [
+            {
+                "filters": [
+                    {"propertyName": CONTACT_EVENTS_PROPERTY, "operator": "HAS_PROPERTY"},
+                    *filters_common,
+                ]
+            },
+            {
+                "filters": [
+                    {
+                        "propertyName": CONTACT_HIGH_ENGAGEMENT_PROPERTY,
+                        "operator": "EQ",
+                        "value": "Yes",
+                    },
+                    *filters_common,
+                ]
+            },
+        ]
+
+        contact_ids: list[str] = []
+        after: str | None = None
+        reported_total: int | None = None
+        while True:
+            payload: dict[str, Any] = {
+                "filterGroups": filter_groups,
+                "properties": ["hs_object_id"],
+                "limit": SEARCH_PAGE_LIMIT,
+                # Stable sort so paging can't repeat or skip records between pages.
+                "sorts": [{"propertyName": "hs_object_id", "direction": "ASCENDING"}],
+            }
+            if after:
+                payload["after"] = after
+            data = self._request("POST", "/crm/v3/objects/contacts/search", json=payload)
+            if "results" not in data:
+                raise HubSpotError(
+                    f"Contact search response missing 'results' key. Raw: {data!r}. "
+                    "Verify the endpoint/shape before proceeding."
+                )
+            if reported_total is None:
+                reported_total = data.get("total")
+            for row in data["results"]:
+                rid = row.get("id")
+                if rid is None:
+                    raise HubSpotError(f"Contact search row missing 'id'. Row: {row!r}")
+                contact_ids.append(str(rid))
+            after = ((data.get("paging") or {}).get("next") or {}).get("after")
+            if not after:
+                break
+            if len(contact_ids) >= SEARCH_RESULT_CEILING:
+                raise HubSpotError(
+                    f"Contact search hit the {SEARCH_RESULT_CEILING}-record paging "
+                    f"ceiling with more pages still available (HubSpot's search API "
+                    f"cannot page past it). The result set would be silently truncated, "
+                    f"so stopping instead. Narrow the date window, or switch this to a "
+                    f"chunked-by-date query."
+                )
+
+        unique_ids = sorted(set(contact_ids))
+        if reported_total is not None and reported_total != len(unique_ids):
+            # Same class of tripwire as the list-membership size cross-check:
+            # HubSpot told us how many it thinks match, so a mismatch means paging
+            # dropped or repeated records.
+            print(
+                f"  !! WARNING: contact search declared total={reported_total} but "
+                f"{len(unique_ids)} unique IDs were collected "
+                f"({len(contact_ids)} before de-duplication). Verify before trusting "
+                f"this run — a short result set silently shrinks the company scope.",
+                file=sys.stderr,
+            )
+        return unique_ids
+
+    def search_companies_with_event_properties(
+        self, properties: list[str]
+    ) -> dict[str, dict]:
+        """Every company currently holding ANY of the marketing-event properties.
+
+        Used to catch companies whose event data has gone stale in the opposite
+        direction from the regression tripwire: the tripwire only inspects
+        companies that are in scope, and a company whose contacts have all lost
+        their event data never enters scope at all. Without this, that company
+        keeps its old values forever with nothing watching it.
+
+        Returns {company_id: {property: value}}.
+        """
+        wanted = list(dict.fromkeys([*COMPANY_EVENT_PROPERTIES, *properties]))
+        # OR-ed groups: a company qualifies if ANY of the three is set, since a
+        # partially-populated company is exactly the kind of thing worth seeing.
+        filter_groups = [
+            {"filters": [{"propertyName": name, "operator": "HAS_PROPERTY"}]}
+            for name in COMPANY_EVENT_PROPERTIES
+        ]
+
+        out: dict[str, dict] = {}
+        after: str | None = None
+        while True:
+            payload: dict[str, Any] = {
+                "filterGroups": filter_groups,
+                "properties": wanted,
+                "limit": SEARCH_PAGE_LIMIT,
+                "sorts": [{"propertyName": "hs_object_id", "direction": "ASCENDING"}],
+            }
+            if after:
+                payload["after"] = after
+            data = self._request("POST", "/crm/v3/objects/companies/search", json=payload)
+            if "results" not in data:
+                raise HubSpotError(
+                    f"Company search response missing 'results' key. Raw: {data!r}"
+                )
+            for row in data["results"]:
+                out[str(row.get("id"))] = row.get("properties", {}) or {}
+            after = ((data.get("paging") or {}).get("next") or {}).get("after")
+            if not after:
+                break
+            if len(out) >= SEARCH_RESULT_CEILING:
+                raise HubSpotError(
+                    f"Company search hit the {SEARCH_RESULT_CEILING}-record paging "
+                    f"ceiling with more pages available; results would be silently "
+                    f"truncated."
+                )
+        return out
 
     # -- primary company resolution -------------------------------------
     def discover_primary_association_type_id(self) -> int:

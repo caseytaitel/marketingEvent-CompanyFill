@@ -24,8 +24,14 @@ from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
-from aggregation import EVENT_LISTS
-from hubspot_client import HubSpotClient, HubSpotError, require_token
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from shared.aggregation import EVENT_LISTS  # noqa: E402
+from shared.hubspot_client import (  # noqa: E402
+    HubSpotClient,
+    HubSpotError,
+    require_token,
+)
 
 
 @dataclass
