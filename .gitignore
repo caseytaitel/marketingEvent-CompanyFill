@@ -8,3 +8,4 @@ input/
 
 # Python artifacts
 __pycache__/
+__init__.py

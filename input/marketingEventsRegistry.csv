@@ -1,5 +1,3 @@
-NAMING CONVENTION =,[Host] - [Event Name] - [Location] - [Date] - [List Type],,,,,
-,,,,,,
 Folder,Sub-folder,List Name,List ID,Tier,Role,Notes
 Channel Partner Events,Crush Security,Crush Security - CISO Live Fire - ATL - 07/31/26 - Attendees,1310,Channel,event_count,
 Channel Partner Events,Crush Security,Crush Security - CISO Live Fire - TX - 06/30/26 - Attendees,1034,Channel,event_count,
@@ -44,4 +42,4 @@ CISO XC,—,CISO XC - ATL - 11/11/25 - Booth Visitors,90,,high_engagement,
 —,—,7AI - Tech Week - BOS - 06/01/26 - Attendees,937,General,event_count,
 —,—,Secure the Dish - 06/09/26 - Attendees,973,General,event_count,
 —,—,CISO Dinner - 10/25 - Attendees,63,General,event_count,
-—,—,IT Security Leaders Lunch - NE - 09/25,65,General,event_count,
+—,—,IT Security Leaders Lunch - NE - 09/25 - Attendees,65,General,event_count,
