@@ -427,7 +427,12 @@ class HubSpotClient:
     def search_companies_with_event_properties(
         self, properties: list[str]
     ) -> dict[str, dict]:
-        """Every company currently holding ANY of the marketing-event properties.
+        """Every company whose marketing-event properties claim real attendance.
+
+        Matches companies with non-zero / affirmative values — not merely
+        fields that have been written. Explicit zeros and false (confirmed
+        no-shows/cancellations) are deliberate and must not keep a company in
+        this result set forever.
 
         Used to catch companies whose event data has gone stale in the opposite
         direction from the regression tripwire: the tripwire only inspects
@@ -438,11 +443,39 @@ class HubSpotClient:
         Returns {company_id: {property: value}}.
         """
         wanted = list(dict.fromkeys([*COMPANY_EVENT_PROPERTIES, *properties]))
-        # OR-ed groups: a company qualifies if ANY of the three is set, since a
-        # partially-populated company is exactly the kind of thing worth seeing.
+        # OR-ed groups: a company qualifies if ANY property claims real data.
+        # HAS_PROPERTY is wrong for the number/bool fields — a written 0 / false
+        # still "has" a value (verified 2026-08-05 on the 22 zeroed companies:
+        # high_engagement_event_attendee="false" matched HAS_PROPERTY). For
+        # marketing_event_type (multi-checkbox), a cleared "" is treated as
+        # absent — HAS_PROPERTY returns false — so that operator is correct.
         filter_groups = [
-            {"filters": [{"propertyName": name, "operator": "HAS_PROPERTY"}]}
-            for name in COMPANY_EVENT_PROPERTIES
+            {
+                "filters": [
+                    {
+                        "propertyName": "distinct_marketing_events_attended",
+                        "operator": "GT",
+                        "value": "0",
+                    }
+                ]
+            },
+            {
+                "filters": [
+                    {
+                        "propertyName": "high_engagement_event_attendee",
+                        "operator": "EQ",
+                        "value": "true",
+                    }
+                ]
+            },
+            {
+                "filters": [
+                    {
+                        "propertyName": "marketing_event_type",
+                        "operator": "HAS_PROPERTY",
+                    }
+                ]
+            },
         ]
 
         out: dict[str, dict] = {}
