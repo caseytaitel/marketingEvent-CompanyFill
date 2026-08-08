@@ -56,6 +56,7 @@ from company_rules import (  # noqa: E402
     compute_company_properties,
     detect_first_touch_conflicts,
     detect_regressions,
+    earliest_nonempty_history_date,
 )
 from hubspot_client import (  # noqa: E402
     CONTACT_CREATEDATE_PROPERTY,
@@ -72,14 +73,17 @@ from registry import (  # noqa: E402
     AggregationError,
     event_date_lookup,
     event_type_lookup,
+    registry_lead_sources,
 )
 from run_output import (  # noqa: E402
     CSV_FILENAME,
     REPORT_FILENAME,
+    WITHHELD_CSV_FILENAME,
     MissingPrimaryContact,
     RunReport,
     write_company_csv,
     write_review_report,
+    write_withheld_companies_csv,
 )
 
 # Realm's fiscal year starts in February (confirmed with the account owner
@@ -283,8 +287,10 @@ def main(argv: list[str] | None = None) -> int:
 
     tier_lookup = event_type_lookup()
     date_lookup = event_date_lookup()
+    reg_lead_sources = registry_lead_sources()
     print(f"Scope: {scope_label}")
-    print(f"Registry covers {len(tier_lookup)} canonical event names.\n")
+    print(f"Registry covers {len(tier_lookup)} canonical event names.")
+    print(f"Registry Lead Source labels: {len(reg_lead_sources)}.\n")
 
     # Phase 1 — the universe: every contact carrying event data, regardless of
     # date. This is what makes step 3 a full recompute; the date flag only
@@ -389,8 +395,77 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"\n  !! {report.volume_warning}", file=sys.stderr)
 
-    # Phase 4 — business rules, no API access.
-    print("\nPhase 4 — computing company properties...")
+    # Phase 4a — First Touch candidate expansion: non-event contacts at in-scope
+    # companies whose Lead Source is filled but not a registry event label.
+    print(
+        f"\nPhase 4a — finding non-event First Touch candidates at "
+        f"{len(in_scope_companies)} in-scope companies..."
+    )
+    company_contacts = client.batch_read_company_contact_ids(sorted(in_scope_companies))
+    associated_ids: set[str] = set()
+    for cids in company_contacts.values():
+        associated_ids.update(cids)
+    already_known = set(universe_ids)
+    new_ids = sorted(associated_ids - already_known)
+    print(
+        f"  {len(associated_ids)} associated contacts; "
+        f"{len(new_ids)} not already in the event-bearing universe."
+    )
+
+    ft_extra_by_company: dict[str, list[ContactEventData]] = defaultdict(list)
+    if new_ids:
+        print(f"  Resolving primary company for {len(new_ids)} new contacts...")
+        new_primary = client.resolve_primary_companies(new_ids)
+        kept_new = {
+            cid: company_id
+            for cid, company_id in new_primary.items()
+            if company_id in in_scope_companies
+        }
+        print(f"  {len(kept_new)} resolve to an in-scope primary company.")
+        if kept_new:
+            new_props = client.batch_read_contacts(
+                sorted(kept_new),
+                [
+                    CONTACT_EVENTS_PROPERTY,
+                    CONTACT_HIGH_ENGAGEMENT_PROPERTY,
+                    CONTACT_LEAD_SOURCE_PROPERTY,
+                    CONTACT_LEAD_SOURCE_DESCRIPTION_PROPERTY,
+                    CONTACT_CREATEDATE_PROPERTY,
+                ],
+            )
+            contact_props.update(new_props)
+            for cid, company_id in kept_new.items():
+                props = contact_props.get(cid, {})
+                ls = (props.get(CONTACT_LEAD_SOURCE_PROPERTY) or "").strip()
+                # Only non-registry LS contacts without event data need to join
+                # the FT pool here; event-bearing contacts are already in universe.
+                events = (props.get(CONTACT_EVENTS_PROPERTY) or "").strip()
+                if not ls or ls in reg_lead_sources or events:
+                    continue
+                ft_extra_by_company[company_id].append(
+                    ContactEventData(
+                        contact_id=cid,
+                        events_attended="",
+                        high_engagement_attendee=props.get(
+                            CONTACT_HIGH_ENGAGEMENT_PROPERTY
+                        )
+                        or "",
+                        lead_source=ls,
+                        lead_source_description=props.get(
+                            CONTACT_LEAD_SOURCE_DESCRIPTION_PROPERTY
+                        )
+                        or "",
+                        createdate=props.get(CONTACT_CREATEDATE_PROPERTY) or "",
+                    )
+                )
+    print(
+        f"  Added {sum(len(v) for v in ft_extra_by_company.values())} "
+        f"FT-only (non-event, non-registry LS) contacts across "
+        f"{len(ft_extra_by_company)} companies."
+    )
+
+    # Phase 4b — build Rules 1–3 contact lists (event-bearing only).
+    print("\nPhase 4b — computing company properties...")
     contacts_by_company = {
         company_id: [
             ContactEventData(
@@ -417,16 +492,94 @@ def main(argv: list[str] | None = None) -> int:
         for company_id in sorted(in_scope_companies)
     }
 
+    # Case-2 contacts needing propertiesWithHistory: non-registry LS in the FT
+    # pool (event-bearing + FT-only extras), scoped to in-scope companies only.
+    case2_ids: list[str] = []
+    for company_id, contacts in contacts_by_company.items():
+        for contact in contacts:
+            ls = (contact.lead_source or "").strip()
+            if ls and ls not in reg_lead_sources:
+                case2_ids.append(contact.contact_id)
+        for contact in ft_extra_by_company.get(company_id, []):
+            case2_ids.append(contact.contact_id)
+    case2_ids = sorted(set(case2_ids))
+    print(
+        f"  Case-2 First Touch contacts needing lead_source history: "
+        f"{len(case2_ids)}"
+    )
+
+    history_batch_calls = (len(case2_ids) + 49) // 50 if case2_ids else 0
+    print(
+        f"  propertiesWithHistory batch calls to add: {history_batch_calls} "
+        f"(50 contacts/call)"
+    )
+    history_raw = client.batch_read_contact_property_history(
+        case2_ids, CONTACT_LEAD_SOURCE_PROPERTY
+    )
+    lead_source_history_dates = {}
+    for cid, entries in history_raw.items():
+        hist_date = earliest_nonempty_history_date(entries)
+        if hist_date is not None:
+            lead_source_history_dates[cid] = hist_date
+    print(
+        f"  Usable history dates: {len(lead_source_history_dates)} of "
+        f"{len(case2_ids)} case-2 contacts."
+    )
+
+    # Read current company values before First Touch compute so the tertiary
+    # tie-break can defer to a recorded first_touch_contact_id. Same payload
+    # also powers the regression / First Touch tripwires and CSV name/domain.
+    print(
+        f"\nPhase 4c — reading current values for "
+        f"{len(in_scope_companies)} companies..."
+    )
+    companies = client.batch_read_companies(
+        sorted(in_scope_companies), COMPANY_PROPERTIES
+    )
+    recorded_first_touch_by_company = {
+        company_id: (props.get("first_touch_contact_id") or "").strip()
+        for company_id, props in companies.items()
+        if (props.get("first_touch_contact_id") or "").strip()
+    }
+
     try:
-        profiles = compute_company_properties(
-            contacts_by_company, tier_lookup, date_lookup
+        result = compute_company_properties(
+            contacts_by_company,
+            tier_lookup,
+            date_lookup,
+            registry_lead_sources=reg_lead_sources,
+            lead_source_history_dates=lead_source_history_dates,
+            first_touch_contacts_by_company=dict(ft_extra_by_company),
+            recorded_first_touch_by_company=recorded_first_touch_by_company,
         )
     except UnmatchedEventError as exc:
         report.unmatched_error = exc
-        report_path = write_review_report(report, {}, {}, out_dir / REPORT_FILENAME)
+        report_path = write_review_report(
+            report, companies, {}, out_dir / REPORT_FILENAME
+        )
         print(f"\nFATAL — {exc}", file=sys.stderr)
         print(f"\nNo CSV written. Review report: {report_path}", file=sys.stderr)
         return 1
+
+    profiles = result.profiles
+    report.zero_history_first_touch = result.zero_history_first_touch
+    if report.zero_history_first_touch:
+        print(
+            f"\n  !! {len(report.zero_history_first_touch)} case-2 contact(s) had "
+            f"Lead Source set but no usable property history — excluded from "
+            f"First Touch this run (see review report).",
+            file=sys.stderr,
+        )
+
+    report.undecided_first_touch_ties = result.undecided_first_touch_ties
+    if report.undecided_first_touch_ties:
+        print(
+            f"\n  !! {len(report.undecided_first_touch_ties)} company(ies) have "
+            f"fully tied First Touch candidates (same effective date and "
+            f"createdate) with no recorded winner among them — withheld for "
+            f"manual review (see review report).",
+            file=sys.stderr,
+        )
 
     first_touch_computed = sum(
         1 for p in profiles.values() if p.first_touch_contact_id
@@ -435,11 +588,15 @@ def main(argv: list[str] | None = None) -> int:
         f"  First Touch computed for {first_touch_computed} of "
         f"{len(profiles)} in-scope companies."
     )
+    print(
+        f"  API volume added for First Touch history: {history_batch_calls} "
+        f"batch/read calls covering {len(case2_ids)} contacts; "
+        f"plus company-to-contact association batches for "
+        f"{len(in_scope_companies)} companies."
+    )
 
-    # Phase 5 — read back what HubSpot currently holds, for the regression /
-    # First Touch tripwires and for the company name/domain columns.
-    print(f"\nPhase 5 — reading current values for {len(profiles)} companies...")
-    companies = client.batch_read_companies(sorted(profiles), COMPANY_PROPERTIES)
+    # Phase 5 — tripwires against the company values read in Phase 4c.
+    print(f"\nPhase 5 — checking regressions / First Touch conflicts...")
 
     report.regressions = detect_regressions(profiles, companies)
     if report.regressions:
@@ -449,7 +606,15 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
 
-    report.first_touch_flags = detect_first_touch_conflicts(profiles, companies)
+    undecided_ids = {t.company_id for t in report.undecided_first_touch_ties}
+    # Undecided ties leave First Touch blank; don't also mis-flag them as
+    # changed_winner against a recorded ID.
+    profiles_for_ft_flags = {
+        cid: p for cid, p in profiles.items() if cid not in undecided_ids
+    }
+    report.first_touch_flags = detect_first_touch_conflicts(
+        profiles_for_ft_flags, companies
+    )
     if report.first_touch_flags:
         print(
             f"\n  !! {len(report.first_touch_flags)} company(ies) have a First "
@@ -457,7 +622,11 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
 
-    withheld = set(report.regressions) | set(report.first_touch_flags)
+    withheld = (
+        set(report.regressions)
+        | set(report.first_touch_flags)
+        | undecided_ids
+    )
 
     # Phase 6 — write.
     write_company_csv(
@@ -468,20 +637,37 @@ def main(argv: list[str] | None = None) -> int:
         out_path=out_dir / CSV_FILENAME,
         report=report,
     )
+    write_withheld_companies_csv(
+        profiles,
+        companies,
+        withheld_company_ids=withheld,
+        excluded_domains=EXCLUDED_COMPANY_DOMAINS,
+        out_path=out_dir / WITHHELD_CSV_FILENAME,
+        report=report,
+    )
     report_path = write_review_report(report, companies, profiles, out_dir / REPORT_FILENAME)
 
     print("-" * 68)
     print(f"Companies in scope:                  {report.in_scope_company_count}")
     print(f"First Touch computed:                {first_touch_computed}")
     print(f"Rows written to CSV:                 {report.written_company_count}")
+    print(
+        f"Rows written to withheld review CSV:  "
+        f"{report.withheld_review_company_count}"
+    )
     print(f"Withheld (regression tripwire):      {len(report.regressions)}")
     print(f"Withheld (First Touch conflict):     {len(report.first_touch_flags)}")
+    print(
+        f"Withheld (undecided FT tie):         "
+        f"{len(report.undecided_first_touch_ties)}"
+    )
     print(f"Excluded (Realm domain):             {len(report.excluded_by_domain)}")
     print(f"Contacts with no primary company:    {len(report.missing_primary)}")
     print(f"Companies with no event contacts:    {len(report.stranded_companies)}")
     print("-" * 68)
-    print(f"\nCSV:           {report.csv_path}")
-    print(f"Review report: {report_path}")
+    print(f"\nCSV:                  {report.csv_path}")
+    print(f"Withheld review CSV:  {report.withheld_csv_path}")
+    print(f"Review report:        {report_path}")
     if report.needs_attention:
         print("\nThis run has findings — read the review report before importing.")
         return 2

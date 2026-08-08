@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """CSV + review-report output for the ongoing company fill.
 
-Two files per run, both under output/YYYY-MM-DD/:
+Three files per run, under output/YYYY-MM-DD/:
 
   marketing_event_company_ongoing_fill.csv
       Import-ready. Contains only companies that are safe to overwrite —
-      anything the regression tripwire flagged is withheld and appears in the
-      review report instead.
+      anything the regression / First Touch tripwires flagged is withheld.
+
+  withheld_companies_review.csv
+      Same column shape as the main CSV plus flag_reason. One full computed
+      row per withheld company — mutually exclusive with the main CSV.
 
   ongoing_review_report.md
       Everything that needs a human. This script runs unattended after each
@@ -29,11 +32,38 @@ from company_rules import (
     CompanyEventProfile,
     FirstTouchFlag,
     RegressionFlag,
+    UndecidedFirstTouchTie,
     UnmatchedEventError,
+    ZeroHistoryFirstTouchContact,
 )
 
 CSV_FILENAME = "marketing_event_company_ongoing_fill.csv"
+WITHHELD_CSV_FILENAME = "withheld_companies_review.csv"
 REPORT_FILENAME = "ongoing_review_report.md"
+
+MAIN_CSV_FIELDNAMES = [
+    "company_id",
+    "company_name",
+    "company_domain",
+    "marketing_event_type",
+    "distinct_marketing_events_attended",
+    "high_engagement_event_attendee",
+    "first_touch_lead_source",
+    "first_touch_lead_source_description",
+    "first_touch_contact_id",
+    "events_attended",
+    "contributing_contact_count",
+]
+
+WITHHELD_CSV_FIELDNAMES = MAIN_CSV_FIELDNAMES + ["flag_reason"]
+
+# Mirrors the review-report phrasing for undecided tertiary ties (that case
+# has no per-flag .reason field the way regressions / FT conflicts do).
+UNDECIDED_FIRST_TOUCH_REASON = (
+    "First Touch candidates tied on both effective date and createdate; "
+    "none of those contacts is the company's currently recorded First Touch "
+    "Contact ID; no winner was chosen"
+)
 
 
 @dataclass
@@ -59,13 +89,21 @@ class RunReport:
     written_company_count: int = 0
     excluded_by_domain: list[tuple[str, str]] = field(default_factory=list)
     withheld_company_count: int = 0
+    withheld_review_company_count: int = 0
     volume_warning: str | None = None
     unmatched_error: UnmatchedEventError | None = None
     regressions: dict[str, list[RegressionFlag]] = field(default_factory=dict)
     first_touch_flags: dict[str, list[FirstTouchFlag]] = field(default_factory=dict)
+    zero_history_first_touch: list[ZeroHistoryFirstTouchContact] = field(
+        default_factory=list
+    )
+    undecided_first_touch_ties: list[UndecidedFirstTouchTie] = field(
+        default_factory=list
+    )
     missing_primary: list[MissingPrimaryContact] = field(default_factory=list)
     stranded_companies: dict[str, dict] = field(default_factory=dict)
     csv_path: Path | None = None
+    withheld_csv_path: Path | None = None
     portal_id: str | None = None
 
     @property
@@ -74,6 +112,8 @@ class RunReport:
             self.unmatched_error
             or self.regressions
             or self.first_touch_flags
+            or self.zero_history_first_touch
+            or self.undecided_first_touch_ties
             or self.missing_primary
             or self.volume_warning
             or self.stranded_companies
@@ -98,6 +138,52 @@ def _contact_link(portal_id: str | None, contact_id: str) -> str:
     )
 
 
+def _company_csv_row(
+    company_id: str,
+    profile: CompanyEventProfile,
+    companies: dict[str, dict],
+) -> dict[str, str | int]:
+    """One full computed company row — same cells for main and withheld CSVs."""
+    props = companies.get(company_id, {})
+    return {
+        "company_id": company_id,
+        "company_name": props.get("name", ""),
+        "company_domain": props.get("domain", ""),
+        "marketing_event_type": profile.marketing_event_type,
+        "distinct_marketing_events_attended": (
+            profile.distinct_marketing_events_attended
+        ),
+        "high_engagement_event_attendee": profile.high_engagement_event_attendee,
+        "first_touch_lead_source": profile.first_touch_lead_source,
+        "first_touch_lead_source_description": (
+            profile.first_touch_lead_source_description
+        ),
+        "first_touch_contact_id": profile.first_touch_contact_id,
+        # Audit trail only — not a company property. Uses "; " for
+        # readability; the property columns above use the portal's exact
+        # ";" form.
+        "events_attended": "; ".join(sorted(profile.events)),
+        "contributing_contact_count": len(profile.contributing_contacts),
+    }
+
+
+def flag_reason_for_company(company_id: str, report: RunReport) -> str:
+    """Combine every withhold reason for one company into a single cell.
+
+    Reuses the existing human-readable `.reason` strings from regression /
+    First Touch flags, plus the review-report phrasing for undecided ties.
+    """
+    parts: list[str] = []
+    for flag in report.regressions.get(company_id, []):
+        parts.append(flag.reason)
+    for flag in report.first_touch_flags.get(company_id, []):
+        parts.append(flag.reason)
+    for tie in report.undecided_first_touch_ties:
+        if tie.company_id == company_id:
+            parts.append(UNDECIDED_FIRST_TOUCH_REASON)
+    return "; ".join(parts)
+
+
 def write_company_csv(
     profiles: dict[str, CompanyEventProfile],
     companies: dict[str, dict],
@@ -113,23 +199,10 @@ def write_company_csv(
     code that put them there.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = [
-        "company_id",
-        "company_name",
-        "company_domain",
-        "marketing_event_type",
-        "distinct_marketing_events_attended",
-        "high_engagement_event_attendee",
-        "first_touch_lead_source",
-        "first_touch_lead_source_description",
-        "first_touch_contact_id",
-        "events_attended",
-        "contributing_contact_count",
-    ]
     lowered_excluded = {d.lower() for d in excluded_domains}
 
     with out_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=MAIN_CSV_FIELDNAMES)
         writer.writeheader()
         for company_id, profile in sorted(profiles.items(), key=lambda kv: kv[0]):
             if company_id in withheld_company_ids:
@@ -141,34 +214,64 @@ def write_company_csv(
                     (company_id, props.get("name") or "(no name)")
                 )
                 continue
-            writer.writerow(
-                {
-                    "company_id": company_id,
-                    "company_name": props.get("name", ""),
-                    "company_domain": props.get("domain", ""),
-                    "marketing_event_type": profile.marketing_event_type,
-                    "distinct_marketing_events_attended": (
-                        profile.distinct_marketing_events_attended
-                    ),
-                    "high_engagement_event_attendee": (
-                        profile.high_engagement_event_attendee
-                    ),
-                    "first_touch_lead_source": profile.first_touch_lead_source,
-                    "first_touch_lead_source_description": (
-                        profile.first_touch_lead_source_description
-                    ),
-                    "first_touch_contact_id": profile.first_touch_contact_id,
-                    # Audit trail only — not a company property. Uses "; " for
-                    # readability; the property columns above use the portal's
-                    # exact ";" form.
-                    "events_attended": "; ".join(sorted(profile.events)),
-                    "contributing_contact_count": len(profile.contributing_contacts),
-                }
-            )
+            writer.writerow(_company_csv_row(company_id, profile, companies))
             report.written_company_count += 1
 
     report.csv_path = out_path
     report.withheld_company_count = len(withheld_company_ids)
+
+
+def write_withheld_companies_csv(
+    profiles: dict[str, CompanyEventProfile],
+    companies: dict[str, dict],
+    withheld_company_ids: set[str],
+    excluded_domains: set[str],
+    out_path: Path,
+    report: RunReport,
+) -> None:
+    """Write one full computed row per withheld company, plus flag_reason.
+
+    Mutually exclusive with the main CSV by construction: only IDs in
+    withheld_company_ids are written here. Domain exclusion matches the main
+    CSV — a Realm-domain company is not written to either file. Stranded
+    companies and no-primary contacts are not in this set.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    lowered_excluded = {d.lower() for d in excluded_domains}
+    written = 0
+
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=WITHHELD_CSV_FIELDNAMES)
+        writer.writeheader()
+        for company_id in sorted(withheld_company_ids):
+            props = companies.get(company_id, {})
+            domain = (props.get("domain") or "").strip().lower()
+            if domain in lowered_excluded:
+                # Same list the main CSV uses — a withheld Realm company never
+                # reaches the main writer's domain check, so record it here.
+                report.excluded_by_domain.append(
+                    (company_id, props.get("name") or "(no name)")
+                )
+                continue
+            profile = profiles.get(company_id)
+            if profile is None:
+                raise RuntimeError(
+                    f"Company {company_id} is withheld but has no computed "
+                    f"profile — cannot write a full review row."
+                )
+            row = _company_csv_row(company_id, profile, companies)
+            reason = flag_reason_for_company(company_id, report)
+            if not reason:
+                raise RuntimeError(
+                    f"Company {company_id} is withheld but has no flag_reason "
+                    f"— every withheld row must explain why."
+                )
+            row["flag_reason"] = reason
+            writer.writerow(row)
+            written += 1
+
+    report.withheld_csv_path = out_path
+    report.withheld_review_company_count = written
 
 
 def write_review_report(
@@ -196,8 +299,14 @@ def write_review_report(
         f"{report.total_event_company_count} with any event history"
     )
     add(f"- **Rows written to the import CSV:** {report.written_company_count}")
+    add(
+        f"- **Rows written to the withheld-companies review CSV:** "
+        f"{report.withheld_review_company_count}"
+    )
     if report.csv_path:
         add(f"- **CSV:** `{report.csv_path.name}`")
+    if report.withheld_csv_path:
+        add(f"- **Withheld review CSV:** `{report.withheld_csv_path.name}`")
     add("")
 
     if not report.needs_attention:
@@ -302,6 +411,68 @@ def write_review_report(
                     f"{_contact_link(report.portal_id, flag.computed_contact_id) if flag.computed_contact_id else '(none)'} | "
                     f"{recorded} | {computed} | {flag.reason} |"
                 )
+        add("")
+
+    if report.zero_history_first_touch:
+        add("## First Touch: Lead Source set but no usable property history")
+        add("")
+        add(
+            f"{len(report.zero_history_first_touch)} contact(s) have a non-event "
+            "Lead Source filled in, but `propertiesWithHistory` returned no "
+            "non-empty revision to date them. They were excluded from First Touch "
+            "competition for this run (not silently counted as blank)."
+        )
+        add("")
+        for item in sorted(
+            report.zero_history_first_touch,
+            key=lambda z: (z.company_id, z.contact_id),
+        ):
+            add(
+                f"- contact {_contact_link(report.portal_id, item.contact_id)} "
+                f"(company {_company_link(report.portal_id, item.company_id)}) — "
+                f"Lead Source `{item.lead_source}`"
+            )
+        add("")
+
+    if report.undecided_first_touch_ties:
+        add("## First Touch: undecided ties withheld from the CSV")
+        add("")
+        add(
+            f"{len(report.undecided_first_touch_ties)} company(ies) have two or "
+            "more First Touch candidates tied on both effective date and "
+            "`createdate` (typical of contacts created in the same bulk import), "
+            "and none of those contacts is the company's currently recorded "
+            "First Touch Contact ID. No winner was chosen; the whole company row "
+            "was withheld from the import CSV for manual review."
+        )
+        add("")
+        add(
+            "| Company | Name | Effective date | createdate | Tied contacts | "
+            "Recorded FT contact |"
+        )
+        add("|---|---|---|---|---|---|")
+        for item in sorted(
+            report.undecided_first_touch_ties,
+            key=lambda t: t.company_id,
+        ):
+            name = (companies.get(item.company_id, {}) or {}).get("name") or (
+                "(no name)"
+            )
+            tied = ", ".join(
+                _contact_link(report.portal_id, cid) for cid in item.contact_ids
+            )
+            recorded = (
+                _contact_link(
+                    report.portal_id, item.recorded_first_touch_contact_id
+                )
+                if item.recorded_first_touch_contact_id
+                else "(none)"
+            )
+            add(
+                f"| {_company_link(report.portal_id, item.company_id)} | {name} | "
+                f"`{item.effective_date.isoformat()}` | `{item.createdate}` | "
+                f"{tied} | {recorded} |"
+            )
         add("")
 
     if report.missing_primary:

@@ -766,3 +766,91 @@ class HubSpotClient:
 
     def batch_read_contacts(self, contact_ids: list[str], properties: list[str]) -> dict[str, dict]:
         return self._batch_read_objects("contacts", contact_ids, properties)
+
+    def batch_read_company_contact_ids(
+        self,
+        company_ids: list[str],
+        progress_label: str = "reading company->contact associations",
+    ) -> dict[str, list[str]]:
+        """All contacts associated with each company (company -> contacts).
+
+        Uses the v4 associations batch endpoint, 100 companies per request.
+        Does not filter to Primary — callers that need primary-only must
+        resolve_primary_companies() on the returned contact IDs.
+        """
+        out: dict[str, list[str]] = {cid: [] for cid in company_ids}
+        unique_ids = sorted(set(company_ids))
+        total_batches = (len(unique_ids) + COMPANY_BATCH_LIMIT - 1) // COMPANY_BATCH_LIMIT
+        for batch_num, i in enumerate(
+            range(0, len(unique_ids), COMPANY_BATCH_LIMIT), start=1
+        ):
+            chunk = unique_ids[i : i + COMPANY_BATCH_LIMIT]
+            print(
+                f"  {progress_label}, batch {batch_num}/{total_batches} "
+                f"({len(chunk)} companies)..."
+            )
+            data = self._request(
+                "POST",
+                "/crm/v4/associations/companies/contacts/batch/read",
+                json={"inputs": [{"id": cid} for cid in chunk]},
+            )
+            for row in data.get("results", []):
+                from_id = str((row.get("from") or {}).get("id") or row.get("fromObjectId") or "")
+                # v4 batch read shape: results[].from.id + results[].to[].toObjectId
+                to_list = row.get("to") or []
+                if from_id and to_list:
+                    out.setdefault(from_id, [])
+                    for to_row in to_list:
+                        to_id = str(to_row.get("toObjectId") or (to_row.get("to") or {}).get("id") or "")
+                        if to_id:
+                            out[from_id].append(to_id)
+            for err in data.get("errors") or []:
+                sub = (err.get("subCategory") or err.get("category") or "")
+                if NO_ASSOCIATIONS_SUBCATEGORY not in str(sub) and "NO_ASSOCIATIONS" not in str(sub):
+                    # Non-benign association errors should not be silent.
+                    raise HubSpotError(
+                        f"company->contact association batch error: {err!r}"
+                    )
+        return out
+
+    def batch_read_contact_property_history(
+        self,
+        contact_ids: list[str],
+        property_name: str,
+        progress_label: str = "reading contact property history",
+    ) -> dict[str, list[dict]]:
+        """propertiesWithHistory for one property, keyed by contact ID.
+
+        Returns the history list HubSpot sends (newest-first). Contacts with
+        no history for the property get an empty list. Batch size 50 — history
+        payloads are larger than plain property reads.
+        """
+        history_batch = 50
+        out: dict[str, list[dict]] = {}
+        unique_ids = sorted(set(contact_ids))
+        if not unique_ids:
+            return out
+        total_batches = (len(unique_ids) + history_batch - 1) // history_batch
+        for batch_num, i in enumerate(range(0, len(unique_ids), history_batch), start=1):
+            chunk = unique_ids[i : i + history_batch]
+            print(
+                f"  {progress_label}, batch {batch_num}/{total_batches} "
+                f"({len(chunk)} contacts)..."
+            )
+            data = self._request(
+                "POST",
+                "/crm/v3/objects/contacts/batch/read",
+                json={
+                    "properties": [property_name],
+                    "propertiesWithHistory": [property_name],
+                    "inputs": [{"id": cid} for cid in chunk],
+                },
+            )
+            for row in data.get("results", []):
+                cid = str(row.get("id"))
+                pwh = row.get("propertiesWithHistory") or {}
+                entries = pwh.get(property_name)
+                out[cid] = list(entries) if isinstance(entries, list) else []
+            for cid in chunk:
+                out.setdefault(cid, [])
+        return out

@@ -17,13 +17,14 @@ The registry is `Marketing_Events_Registry`. Its columns:
 | **Events Attended Appendage** | **Yes — this is the lookup key** | The exact string Ops types into a contact's Events Attended field |
 | **Event Type** | **Yes** | Channel or General |
 | **Event Date** | **Yes** | Used to determine "earliest event" for first touch |
-| Lead Source | No | Ops reference only, for filling in the contact's own Lead Source field |
+| **Lead Source** | **Yes — membership check only** | Used to classify a contact's own Lead Source as "registry-backed" vs. not, for Rule 4's effective-date logic. Never copied onto anything — the *value* written to a company always comes from the winning contact's own fields, never from this column. |
 | Lead Source Description | No | Ops reference only, for filling in the contact's own Lead Source Description field |
 
-Only three columns are ever read programmatically: **Events Attended Appendage**
-(the key), **Event Type**, and **Event Date**. Lead Source and Lead Source
-Description in the registry are never read by code — they exist purely so Ops
-has a reference when manually filling in the matching fields on the contact.
+Four columns are read programmatically: **Events Attended Appendage** (the
+key), **Event Type**, **Event Date**, and **Lead Source** (membership check
+only). Lead Source Description in the registry is never read by code — it
+exists purely so Ops has a reference when manually filling in the matching
+field on the contact.
 
 `Events Attended Appendage` and `Lead Source Description` are identical in every
 row today. Do not assume they always will be — look them up separately, don't
@@ -86,18 +87,67 @@ Yes/No. "Yes/No" above describes the *behavior*, not the literal string.
 
 ## Rule 4 — First Touch (Lead Source, Lead Source Description, Contact ID)
 
-Among all the contacts at the company, find whichever one attended the
-earliest event, using that event's date from the registry. That contact is
-the "winner." If two or more contacts are tied for the earliest event, break
-the tie by picking whichever one of them was created in HubSpot first.
+Every contact belonging to the company gets one "effective date" to compete
+on, based on how their Lead Source is set:
+
+- **Lead Source is a registry value, and they have events attended:**
+  effective date = the earliest Event Date (from the registry) among their
+  own events.
+- **Lead Source is filled but is *not* a registry value** (regardless of
+  whether they also have events attended): effective date = the earliest
+  timestamp at which `lead_source__deal_source` was first set to a
+  non-empty value, per HubSpot's property history
+  (`propertiesWithHistory`). Use the oldest non-empty entry in the returned
+  history — not the timestamp on the contact's current value.
+- **Lead Source is blank:** doesn't compete. Nothing to copy from them
+  regardless.
+
+Whoever has the earliest effective date across all eligible contacts at the
+company is the "winner." If two or more are tied on effective date, break
+the tie by picking whichever one was created in HubSpot first.
+
+**Tertiary tie-break, locked:** if effective date *and* `createdate` are
+both tied — this happens with contacts created in the same bulk import,
+sharing an identical timestamp to the millisecond — prefer whichever tied
+contact is already recorded as the company's current First Touch Contact
+ID, if one of them is. There's no real signal distinguishing bulk-import
+siblings from each other; defer to the existing answer rather than flip
+between them on iteration order.
+
+**Not yet decided:** what to do when *no* tied contact is the currently
+recorded winner (e.g., a company with no prior First Touch value at all,
+whose top two candidates are fully tied on every level). Proposed default:
+flag for manual review rather than guess — confirm before building.
 
 Once you have the winner: copy that contact's own Lead Source straight onto
 the company's First Touch Lead Source. Copy that contact's own Lead Source
-Description straight onto the company's First Touch Lead Source Description.
-Record that contact's ID as the company's First Touch Contact ID.
+Description straight onto the company's First Touch Lead Source
+Description. Record that contact's ID as the company's First Touch Contact
+ID.
 
 This is a direct copy of the winning contact's own fields — never a lookup
 into the registry's Lead Source columns.
+
+**Known limitation, confirmed against HubSpot's own documentation:**
+HubSpot retains only the most recent 45 revisions per contact property. For
+a contact whose Lead Source has been edited more than 45 times, the true
+first-ever fill date may have been pruned, and the earliest *retained*
+entry gets used instead — a lower bound, not a guarantee of the true first
+date. Checked against this portal specifically: revision counts on
+non-registry Lead Source values are very low in practice (mean ~1.1, max
+observed 5 across a 200-contact sample, none near 45) — a documented
+limitation, not a live risk today. Worth re-checking if that changes.
+
+**A related limitation, not solved here, just acknowledged:** a first-fill
+timestamp only reflects reality if nobody edited the field long after the
+fact. Several edits clustered in one short window, well after the
+contact's own creation date, look like a later cleanup pass rather than a
+true early touch. This codebase does not attempt to detect or correct for
+that — it uses the earliest recorded non-empty entry as given.
+
+**Parked, not yet decided:** what happens when a case-2 contact's Lead
+Source is filled but its property history returns zero non-empty entries
+at all. Not part of this build.
 
 ## Flags
 
@@ -119,6 +169,43 @@ do not assume these descriptions match the current code):
   review, and do **not** overwrite the existing First Touch Contact ID, First
   Touch Lead Source, or First Touch Lead Source Description.
 
+## Withheld-companies review CSV
+
+Every company withheld from the main import CSV — for a regression, a First
+Touch conflict, or a First Touch tertiary-tie-undecided case — also gets a
+row in a second file, same shape as the main CSV plus one extra column.
+
+**One row per company, never one row per reason.** If a company is withheld
+for more than one reason (e.g. a regression on Marketing Event Type *and* a
+First Touch conflict), it still gets exactly one row, with every reason it
+was withheld combined into a single `flag_reason` cell — reuse the existing
+human-readable reason phrasing already used in the review report (e.g.
+`"count dropped by 1; previously-set tier disappeared: Channel Event
+Attendee; computed First Touch contact X differs from recorded Y"`).
+
+**Full row, not partial.** Every column that exists in the main CSV — all
+six company properties, plus the audit columns — is populated with the same
+freshly-computed values that would have gone into the main CSV had this
+company not been withheld. Never a half-row mixing an old value with a new
+one; a company's row is either accepted whole or not imported at all.
+
+**A company appears in exactly one of the two CSVs, never both** — the main
+CSV and this review CSV are mutually exclusive by construction: withheld
+means it's not in the main CSV, full stop.
+
+**Not included here, unchanged:**
+- Stranded companies (no fresh computed row exists for them — there's
+  nothing to put in a row).
+- Contacts with event data but no primary company — that's a contact-level
+  problem, not a company row to accept or reject.
+- Companies excluded by domain (`realm.security`) — same exclusion as the
+  main CSV; not written to either output file, even if they would otherwise
+  be withheld for a regression, First Touch conflict, or undecided tie.
+
+**Intended workflow:** open this file, delete the rows you're not ready to
+accept, import what's left through the same HubSpot property mapping
+already used for the main CSV — the column shape is identical.
+
 ## Explicitly out of scope
 
 - Lead Source and Lead Source Description on the Contact are Ops's permanent
@@ -130,3 +217,9 @@ do not assume these descriptions match the current code):
   Source Description follows the same naming convention as First Touch Lead
   Source Description (i.e., it holds a canonical event name), so Ops knows
   the expected format — but nothing here computes it.
+- Realm (`realm.security`) is excluded from every output file — the main
+  import CSV and the withheld-companies review CSV alike — so employee
+  attendance never tiers Realm as a target account. Domain exclusion is a
+  property of the outputs, not of the main CSV alone. Exclusions are listed
+  in the review report's existing "Excluded by domain" section (including
+  Realm companies that would otherwise have been withheld).

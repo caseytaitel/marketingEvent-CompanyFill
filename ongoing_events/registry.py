@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Marketing-event registry — load and look up, no API calls.
 
-Source of truth: ongoing_events/input/marketingEventsRegistry.csv. Code reads
-exactly three columns:
+Source of truth: ongoing_events/input/marketingEventsRegistry.csv. Code reads:
 
   Events Attended Appendage  — lookup key (matches contact events_attended)
   Event Type                 — Channel | General
   Event Date                 — earliest-event ordering for First Touch
+  Lead Source                — classification only: whether a contact's own
+                               Lead Source is an "event" registry value for
+                               First Touch effective-date selection. Never
+                               copied onto the company.
 
 Everything else in the CSV is Ops reference only and is ignored here.
 """
@@ -39,7 +42,7 @@ _REGISTRY_CSV = (
 # Columns the ongoing rollup actually reads. Named explicitly so a future
 # registry edit that renames one fails loudly at load time.
 _REQUIRED_COLUMNS = frozenset(
-    {"Events Attended Appendage", "Event Type", "Event Date"}
+    {"Events Attended Appendage", "Event Type", "Event Date", "Lead Source"}
 )
 
 
@@ -50,6 +53,7 @@ class EventRegistryEntry:
     event_name: str
     event_type: str  # "Channel" | "General"
     event_date: date
+    lead_source: str  # Ops label; used only to classify contact Lead Sources
 
 
 def _parse_event_date(raw: str, *, path: Path, row_num: int) -> date:
@@ -71,8 +75,8 @@ def load_event_registry(
     """Load the event registry keyed by Events Attended Appendage.
 
     Empty separator rows (blank appendage) are skipped. Duplicate appendage
-    keys, blank Event Type/Date on a real row, or an Event Type other than
-    Channel/General are hard errors.
+    keys, blank Event Type/Date/Lead Source on a real row, or an Event Type
+    other than Channel/General are hard errors.
     """
     path = Path(csv_path)
     loaded: dict[str, EventRegistryEntry] = {}
@@ -107,6 +111,13 @@ def load_event_registry(
                     f"got {event_type!r}"
                 )
 
+            lead_source = (row.get("Lead Source") or "").strip()
+            if not lead_source:
+                raise AggregationError(
+                    f"Registry CSV {path} row {row_num} ({event_name!r}): "
+                    f"blank Lead Source (needed for First Touch classification)"
+                )
+
             event_date = _parse_event_date(
                 row.get("Event Date") or "", path=path, row_num=row_num
             )
@@ -114,6 +125,7 @@ def load_event_registry(
                 event_name=event_name,
                 event_type=event_type,
                 event_date=event_date,
+                lead_source=lead_source,
             )
 
     if not loaded:
@@ -133,3 +145,8 @@ def event_type_lookup() -> dict[str, str]:
 def event_date_lookup() -> dict[str, date]:
     """canonical event name -> Event Date."""
     return {name: entry.event_date for name, entry in EVENT_REGISTRY.items()}
+
+
+def registry_lead_sources() -> set[str]:
+    """Distinct Lead Source labels from the registry (First Touch classification)."""
+    return {entry.lead_source for entry in EVENT_REGISTRY.values() if entry.lead_source}

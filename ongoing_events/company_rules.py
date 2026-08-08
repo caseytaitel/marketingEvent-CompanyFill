@@ -9,10 +9,12 @@ Input is the contact properties Ops maintains by hand (read-only here):
   events_attended              free-text, "; "-delimited canonical event names
   high_engagement_attendee     "Yes" / "No" / blank
   lead_source__deal_source     copied onto company First Touch when this
-                               contact wins
+                               contact wins; also classifies First Touch
+                               effective-date path (registry vs history)
   lead_source_description      same
   createdate                   tie-break when two contacts share the earliest
-                               event date
+                               effective date; identical createdate falls
+                               through to the recorded First Touch Contact ID
 
 Output is the six company properties, already in the exact string form the
 HubSpot property options use, so a CSV cell can be compared byte-for-byte
@@ -23,6 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
+from typing import Any
 
 # Registry types are "Channel" / "General"; the HubSpot property options are the
 # longer labels below. Confirmed against the live portal 2026-08-04 by reading
@@ -185,71 +188,218 @@ def parse_contact_createdate(raw: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def earliest_nonempty_history_date(entries: list[dict[str, Any]]) -> date | None:
+    """Oldest non-empty value's calendar date from a propertiesWithHistory list.
+
+    HubSpot returns history newest-first; this scans every entry and takes the
+    minimum timestamp among those with a non-empty value. Clears (`""`) do not
+    count. Returns None when there is no usable entry.
+    """
+    best: datetime | None = None
+    for entry in entries:
+        value = (entry.get("value") or "").strip()
+        if not value:
+            continue
+        raw_ts = entry.get("timestamp")
+        if not raw_ts:
+            continue
+        try:
+            ts = parse_contact_createdate(str(raw_ts))
+        except ValueError:
+            continue
+        if best is None or ts < best:
+            best = ts
+    return best.date() if best is not None else None
+
+
+@dataclass(frozen=True)
+class ZeroHistoryFirstTouchContact:
+    """Case-2 contact with Lead Source set but no usable property history."""
+
+    company_id: str
+    contact_id: str
+    lead_source: str
+
+
+@dataclass(frozen=True)
+class UndecidedFirstTouchTie:
+    """Effective date and createdate both tied; no recorded FT among them."""
+
+    company_id: str
+    effective_date: date
+    createdate: str
+    contact_ids: tuple[str, ...]
+    recorded_first_touch_contact_id: str
+
+
+@dataclass
+class CompanyPropertiesResult:
+    profiles: dict[str, CompanyEventProfile]
+    zero_history_first_touch: list[ZeroHistoryFirstTouchContact] = field(
+        default_factory=list
+    )
+    undecided_first_touch_ties: list[UndecidedFirstTouchTie] = field(
+        default_factory=list
+    )
+
+
 def _select_first_touch_winner(
     contacts: list[ContactEventData],
     matched_events_by_contact: dict[str, list[str]],
     date_lookup: dict[str, date],
-) -> ContactEventData | None:
-    """Earliest registry event date wins; ties break on earliest createdate."""
-    best_date: date | None = None
-    contenders: dict[str, ContactEventData] = {}
+    registry_lead_sources: set[str],
+    lead_source_history_dates: dict[str, date],
+    company_id: str,
+    recorded_first_touch_contact_id: str = "",
+) -> tuple[
+    ContactEventData | None,
+    list[ZeroHistoryFirstTouchContact],
+    UndecidedFirstTouchTie | None,
+]:
+    """Earliest effective date wins; ties break on earliest createdate.
+
+    When effective date and createdate both tie (bulk-import siblings), prefer
+    the company's currently recorded First Touch Contact ID if it is among the
+    tied contacts. If none of them is the recorded winner, return no winner and
+    an UndecidedFirstTouchTie for manual review — do not pick arbitrarily.
+
+    Effective date:
+      - Lead Source is a registry value AND contact has matched events →
+        earliest registry Event Date among those events
+      - Lead Source filled but not a registry value → earliest non-empty
+        lead_source__deal_source history date (supplied by caller)
+      - Lead Source blank, or registry-LS with no events → does not compete
+      - Non-registry Lead Source with no usable history → excluded + reported
+    """
+    zero_history: list[ZeroHistoryFirstTouchContact] = []
+    # contact_id -> (effective_date, contact)
+    candidates: dict[str, tuple[date, ContactEventData]] = {}
 
     for contact in contacts:
-        for event_name in matched_events_by_contact.get(contact.contact_id, []):
-            event_date = date_lookup[event_name]
-            if best_date is None or event_date < best_date:
-                best_date = event_date
-                contenders = {contact.contact_id: contact}
-            elif event_date == best_date:
-                contenders[contact.contact_id] = contact
+        ls = (contact.lead_source or "").strip()
+        if not ls:
+            continue
 
-    if not contenders:
-        return None
+        if ls in registry_lead_sources:
+            events = matched_events_by_contact.get(contact.contact_id, [])
+            if not events:
+                continue
+            eff = min(date_lookup[name] for name in events)
+            candidates[contact.contact_id] = (eff, contact)
+            continue
+
+        # Case-2: non-registry Lead Source — history date required.
+        hist_date = lead_source_history_dates.get(contact.contact_id)
+        if hist_date is None:
+            zero_history.append(
+                ZeroHistoryFirstTouchContact(
+                    company_id=company_id,
+                    contact_id=contact.contact_id,
+                    lead_source=ls,
+                )
+            )
+            continue
+        candidates[contact.contact_id] = (hist_date, contact)
+
+    if not candidates:
+        return None, zero_history, None
+
+    best_date = min(eff for eff, _ in candidates.values())
+    contenders = [c for eff, c in candidates.values() if eff == best_date]
     if len(contenders) == 1:
-        return next(iter(contenders.values()))
+        return contenders[0], zero_history, None
 
-    def sort_key(contact: ContactEventData) -> datetime:
+    def createdate_key(contact: ContactEventData) -> datetime:
         try:
             return parse_contact_createdate(contact.createdate)
         except ValueError as exc:
             raise OngoingAggregationError(
-                f"Contact {contact.contact_id} is tied for earliest event date "
-                f"({best_date.isoformat()}) but has an unusable createdate "
-                f"({contact.createdate!r}); cannot break the First Touch tie. "
+                f"Contact {contact.contact_id} is tied for earliest First Touch "
+                f"effective date ({best_date.isoformat()}) but has an unusable "
+                f"createdate ({contact.createdate!r}); cannot break the tie. "
                 f"{exc}"
             ) from exc
 
-    return min(contenders.values(), key=sort_key)
+    best_createdate = min(createdate_key(c) for c in contenders)
+    createdate_tied = [
+        c for c in contenders if createdate_key(c) == best_createdate
+    ]
+    if len(createdate_tied) == 1:
+        return createdate_tied[0], zero_history, None
+
+    # Tertiary: identical effective date + createdate (bulk-import siblings).
+    recorded = (recorded_first_touch_contact_id or "").strip()
+    if recorded:
+        for contact in createdate_tied:
+            if contact.contact_id == recorded:
+                return contact, zero_history, None
+
+    tied_ids = tuple(sorted(c.contact_id for c in createdate_tied))
+    return (
+        None,
+        zero_history,
+        UndecidedFirstTouchTie(
+            company_id=company_id,
+            effective_date=best_date,
+            createdate=createdate_tied[0].createdate,
+            contact_ids=tied_ids,
+            recorded_first_touch_contact_id=recorded,
+        ),
+    )
 
 
 def compute_company_properties(
     contacts_by_company: dict[str, list[ContactEventData]],
     tier_lookup: dict[str, str],
     date_lookup: dict[str, date] | None = None,
-) -> dict[str, CompanyEventProfile]:
+    registry_lead_sources: set[str] | None = None,
+    lead_source_history_dates: dict[str, date] | None = None,
+    first_touch_contacts_by_company: dict[str, list[ContactEventData]] | None = None,
+    recorded_first_touch_by_company: dict[str, str] | None = None,
+) -> CompanyPropertiesResult:
     """Roll Ops-maintained contact properties up to company property values.
 
-    contacts_by_company : {company_id: [ContactEventData, ...]} — must already
-                          contain EVERY event-bearing contact of each company,
-                          not just the ones that triggered the company's
-                          inclusion in this run. Full recompute is the rule; a
-                          date flag decides which companies get touched, never
-                          which contacts get counted once a company is in scope.
-    tier_lookup         : canonical_event -> "Channel" | "General", from
-                          registry.event_type_lookup().
-    date_lookup         : canonical_event -> date, from
-                          registry.event_date_lookup(). Required for First
-                          Touch; when omitted, First Touch fields stay blank
-                          (Rules 1–3 still compute).
+    contacts_by_company : {company_id: [ContactEventData, ...]} — every
+                          event-bearing contact of each company (Rules 1–3).
+                          Full recompute; a date flag decides which companies
+                          get touched, never which contacts get counted once
+                          a company is in scope.
+    tier_lookup         : canonical_event -> "Channel" | "General"
+    date_lookup         : canonical_event -> date. Required for First Touch;
+                          when omitted, First Touch fields stay blank.
+    registry_lead_sources : Lead Source labels from the registry. Required for
+                          First Touch classification when date_lookup is set.
+    lead_source_history_dates : contact_id -> earliest non-empty LS history
+                          date, for non-registry Lead Source contacts only.
+    first_touch_contacts_by_company : optional extra contacts (e.g. non-event
+                          case-2) merged into the First Touch candidate pool
+                          only — never into Rules 1–3.
+    recorded_first_touch_by_company : company_id -> currently recorded
+                          first_touch_contact_id, used only as the tertiary
+                          tie-break when effective date and createdate both tie.
 
     Raises UnmatchedEventError if any event name is absent from tier_lookup.
-    ALL unmatched names are collected before raising, so one run surfaces every
-    registry gap rather than making Ops fix them one at a time. First Touch is
-    not computed when unmatched names are present — the hard stop fires first.
     """
     dates = date_lookup if date_lookup is not None else {}
+    reg_ls = registry_lead_sources if registry_lead_sources is not None else set()
+    history_dates = (
+        lead_source_history_dates if lead_source_history_dates is not None else {}
+    )
+    ft_extras = (
+        first_touch_contacts_by_company
+        if first_touch_contacts_by_company is not None
+        else {}
+    )
+    recorded_ft = (
+        recorded_first_touch_by_company
+        if recorded_first_touch_by_company is not None
+        else {}
+    )
+
     profiles: dict[str, CompanyEventProfile] = {}
     unmatched: list[UnmatchedEvent] = []
+    zero_history: list[ZeroHistoryFirstTouchContact] = []
+    undecided_ties: list[UndecidedFirstTouchTie] = []
 
     for company_id, contacts in contacts_by_company.items():
         profile = CompanyEventProfile(company_id)
@@ -277,10 +427,25 @@ def compute_company_properties(
                     event_name
                 )
 
-        if dates and matched_events_by_contact:
-            winner = _select_first_touch_winner(
-                contacts, matched_events_by_contact, dates
+        if dates:
+            # First Touch pool = event-bearing contacts + any FT-only extras.
+            # Deduplicate by contact_id (extras must not override event rows).
+            by_id = {c.contact_id: c for c in contacts}
+            for extra in ft_extras.get(company_id, []):
+                by_id.setdefault(extra.contact_id, extra)
+            ft_contacts = list(by_id.values())
+            winner, zh, undecided = _select_first_touch_winner(
+                ft_contacts,
+                matched_events_by_contact,
+                dates,
+                reg_ls,
+                history_dates,
+                company_id,
+                recorded_first_touch_contact_id=recorded_ft.get(company_id, ""),
             )
+            zero_history.extend(zh)
+            if undecided is not None:
+                undecided_ties.append(undecided)
             if winner is not None:
                 profile.first_touch_contact_id = winner.contact_id
                 profile.first_touch_lead_source = winner.lead_source or ""
@@ -292,7 +457,11 @@ def compute_company_properties(
 
     if unmatched:
         raise UnmatchedEventError(unmatched)
-    return profiles
+    return CompanyPropertiesResult(
+        profiles=profiles,
+        zero_history_first_touch=zero_history,
+        undecided_first_touch_ties=undecided_ties,
+    )
 
 
 # ---------------------------------------------------------------------------
