@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Unit tests for the ongoing aggregation rules. No API access, no token.
+"""Unit tests for the company property rules. No API access, no token.
 
 Run directly:
 
-    python ongoing_events/test_ongoing_aggregation.py
+    python ongoing_events/test_company_rules.py
 
 Deliberately dependency-free (plain asserts, no pytest) so the aggregation math
 can be verified on any machine that can run the script itself. pytest will also
@@ -17,20 +17,28 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from ongoing_aggregation import (  # noqa: E402
+from datetime import date  # noqa: E402
+
+from company_rules import (  # noqa: E402
     ContactEventData,
     UnmatchedEventError,
     compute_company_properties,
+    detect_first_touch_conflicts,
     detect_regressions,
     split_events,
 )
 
 # A fake registry: real event names are long and dated, but nothing here depends
-# on their shape, only on the tier they map to.
+# on their shape, only on the tier / date they map to.
 TIERS = {
     "Alpha Summit - NYC - 01/01/26": "General",
     "Beta Partner Dinner - ATL - 02/02/26": "Channel",
     "Gamma Con - BOS - 03/03/26": "General",
+}
+DATES = {
+    "Alpha Summit - NYC - 01/01/26": date(2026, 1, 1),
+    "Beta Partner Dinner - ATL - 02/02/26": date(2026, 2, 2),
+    "Gamma Con - BOS - 03/03/26": date(2026, 3, 3),
 }
 
 
@@ -215,6 +223,165 @@ def test_company_absent_from_hubspot_is_not_a_regression() -> None:
         {"C1": [ContactEventData("p1", "Alpha Summit - NYC - 01/01/26")]}, TIERS
     )
     assert detect_regressions(profiles, {}) == {}
+
+
+def test_first_touch_picks_earliest_event_contact() -> None:
+    """Normal case: the contact who attended the earliest event wins."""
+    profiles = compute_company_properties(
+        {
+            "C1": [
+                ContactEventData(
+                    "p_late",
+                    "Gamma Con - BOS - 03/03/26",
+                    lead_source="Marketing - Late",
+                    lead_source_description="Gamma Con - BOS - 03/03/26",
+                    createdate="2020-01-01T00:00:00.000Z",
+                ),
+                ContactEventData(
+                    "p_early",
+                    "Alpha Summit - NYC - 01/01/26",
+                    lead_source="Marketing - Early",
+                    lead_source_description="Alpha Summit - NYC - 01/01/26",
+                    createdate="2024-06-01T00:00:00.000Z",
+                ),
+            ]
+        },
+        TIERS,
+        DATES,
+    )
+    p = profiles["C1"]
+    assert p.first_touch_contact_id == "p_early"
+    assert p.first_touch_lead_source == "Marketing - Early"
+    assert p.first_touch_lead_source_description == "Alpha Summit - NYC - 01/01/26"
+
+
+def test_first_touch_tie_breaks_on_earliest_createdate() -> None:
+    """Two contacts, same earliest event date → older HubSpot createdate wins."""
+    profiles = compute_company_properties(
+        {
+            "C1": [
+                ContactEventData(
+                    "p_newer",
+                    "Alpha Summit - NYC - 01/01/26",
+                    lead_source="Marketing - Newer",
+                    lead_source_description="Alpha Summit - NYC - 01/01/26",
+                    createdate="2024-06-01T00:00:00.000Z",
+                ),
+                ContactEventData(
+                    "p_older",
+                    "Alpha Summit - NYC - 01/01/26; Gamma Con - BOS - 03/03/26",
+                    lead_source="Marketing - Older",
+                    lead_source_description="Alpha Summit - NYC - 01/01/26",
+                    createdate="2021-03-15T12:00:00.000Z",
+                ),
+            ]
+        },
+        TIERS,
+        DATES,
+    )
+    p = profiles["C1"]
+    assert p.first_touch_contact_id == "p_older"
+    assert p.first_touch_lead_source == "Marketing - Older"
+
+
+def test_first_touch_flag_changed_winner() -> None:
+    profiles = compute_company_properties(
+        {
+            "C1": [
+                ContactEventData(
+                    "p_new_winner",
+                    "Alpha Summit - NYC - 01/01/26",
+                    lead_source="Marketing - New",
+                    lead_source_description="Alpha Summit - NYC - 01/01/26",
+                    createdate="2020-01-01T00:00:00.000Z",
+                )
+            ]
+        },
+        TIERS,
+        DATES,
+    )
+    flagged = detect_first_touch_conflicts(
+        profiles,
+        {
+            "C1": {
+                "first_touch_contact_id": "p_old_winner",
+                "first_touch_lead_source": "Marketing - Old",
+                "first_touch_lead_source_description": "Something Else",
+            }
+        },
+    )
+    assert "C1" in flagged
+    assert flagged["C1"][0].kind == "changed_winner"
+    assert flagged["C1"][0].computed_contact_id == "p_new_winner"
+    assert flagged["C1"][0].existing_contact_id == "p_old_winner"
+
+
+def test_first_touch_flag_same_winner_changed_lead_source() -> None:
+    profiles = compute_company_properties(
+        {
+            "C1": [
+                ContactEventData(
+                    "p1",
+                    "Alpha Summit - NYC - 01/01/26",
+                    lead_source="Marketing - Updated",
+                    lead_source_description="Alpha Summit - NYC - 01/01/26",
+                    createdate="2020-01-01T00:00:00.000Z",
+                )
+            ]
+        },
+        TIERS,
+        DATES,
+    )
+    flagged = detect_first_touch_conflicts(
+        profiles,
+        {
+            "C1": {
+                "first_touch_contact_id": "p1",
+                "first_touch_lead_source": "Marketing - Original",
+                "first_touch_lead_source_description": "Alpha Summit - NYC - 01/01/26",
+            }
+        },
+    )
+    assert "C1" in flagged
+    assert flagged["C1"][0].kind == "changed_lead_source"
+    assert flagged["C1"][0].computed_lead_source == "Marketing - Updated"
+    assert flagged["C1"][0].existing_lead_source == "Marketing - Original"
+
+
+def test_first_touch_no_flag_when_unset_or_unchanged() -> None:
+    profiles = compute_company_properties(
+        {
+            "C1": [
+                ContactEventData(
+                    "p1",
+                    "Alpha Summit - NYC - 01/01/26",
+                    lead_source="Marketing - A",
+                    lead_source_description="Alpha Summit - NYC - 01/01/26",
+                    createdate="2020-01-01T00:00:00.000Z",
+                )
+            ]
+        },
+        TIERS,
+        DATES,
+    )
+    # Never set before — write freely.
+    assert detect_first_touch_conflicts(profiles, {}) == {}
+    # Same winner, same LS/LSD — no conflict.
+    assert (
+        detect_first_touch_conflicts(
+            profiles,
+            {
+                "C1": {
+                    "first_touch_contact_id": "p1",
+                    "first_touch_lead_source": "Marketing - A",
+                    "first_touch_lead_source_description": (
+                        "Alpha Summit - NYC - 01/01/26"
+                    ),
+                }
+            },
+        )
+        == {}
+    )
 
 
 def main() -> int:

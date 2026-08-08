@@ -25,8 +25,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from ongoing_aggregation import (
+from company_rules import (
     CompanyEventProfile,
+    FirstTouchFlag,
     RegressionFlag,
     UnmatchedEventError,
 )
@@ -61,6 +62,7 @@ class RunReport:
     volume_warning: str | None = None
     unmatched_error: UnmatchedEventError | None = None
     regressions: dict[str, list[RegressionFlag]] = field(default_factory=dict)
+    first_touch_flags: dict[str, list[FirstTouchFlag]] = field(default_factory=dict)
     missing_primary: list[MissingPrimaryContact] = field(default_factory=list)
     stranded_companies: dict[str, dict] = field(default_factory=dict)
     csv_path: Path | None = None
@@ -71,6 +73,7 @@ class RunReport:
         return bool(
             self.unmatched_error
             or self.regressions
+            or self.first_touch_flags
             or self.missing_primary
             or self.volume_warning
             or self.stranded_companies
@@ -117,6 +120,9 @@ def write_company_csv(
         "marketing_event_type",
         "distinct_marketing_events_attended",
         "high_engagement_event_attendee",
+        "first_touch_lead_source",
+        "first_touch_lead_source_description",
+        "first_touch_contact_id",
         "events_attended",
         "contributing_contact_count",
     ]
@@ -147,6 +153,11 @@ def write_company_csv(
                     "high_engagement_event_attendee": (
                         profile.high_engagement_event_attendee
                     ),
+                    "first_touch_lead_source": profile.first_touch_lead_source,
+                    "first_touch_lead_source_description": (
+                        profile.first_touch_lead_source_description
+                    ),
+                    "first_touch_contact_id": profile.first_touch_contact_id,
                     # Audit trail only — not a company property. Uses "; " for
                     # readability; the property columns above use the portal's
                     # exact ";" form.
@@ -193,9 +204,9 @@ def write_review_report(
         add("## Nothing needs attention")
         add("")
         add(
-            "No unmatched event names, no regressions, no contacts stranded "
-            "without a primary company, and the run size looked normal. The CSV "
-            "is ready to spot-check and import."
+            "No unmatched event names, no regressions, no First Touch conflicts, "
+            "no contacts stranded without a primary company, and the run size "
+            "looked normal. The CSV is ready to spot-check and import."
         )
         add("")
 
@@ -204,7 +215,8 @@ def write_review_report(
         add("")
         add(
             "One or more `events_attended` values are not in "
-            "`input/marketingEventsRegistry.csv`. **No CSV was written.** This is "
+            "`ongoing_events/input/marketingEventsRegistry.csv`. **No CSV was "
+            "written.** This is "
             "the expected outcome when Ops adds a new event to contacts before "
             "adding the registry row — add the row (with its Channel/General "
             "tier) and re-run."
@@ -252,6 +264,44 @@ def write_review_report(
                 f"- {company_id}: {len(profile.contributing_contacts)} contributing "
                 f"contact(s) — {events}"
             )
+        add("")
+
+    if report.first_touch_flags:
+        add("## First Touch conflicts withheld from the CSV")
+        add("")
+        add(
+            f"{len(report.first_touch_flags)} company(ies) already have a First "
+            "Touch Contact ID recorded, and a fresh full recompute disagrees with "
+            "what HubSpot holds — either a different winning contact, or the same "
+            "contact with a changed Lead Source / Lead Source Description. First "
+            "Touch fields were **not overwritten**; the whole company row was "
+            "withheld from the import CSV for manual review (same withhold-and-flag "
+            "shape as the regression tripwire)."
+        )
+        add("")
+        add(
+            "| Company | Name | Kind | Recorded contact | Computed contact | "
+            "Recorded LS / LSD | Computed LS / LSD | Why flagged |"
+        )
+        add("|---|---|---|---|---|---|---|---|")
+        for company_id, flags in sorted(report.first_touch_flags.items()):
+            name = (companies.get(company_id, {}) or {}).get("name") or "(no name)"
+            for flag in flags:
+                recorded = (
+                    f"`{flag.existing_lead_source}` / "
+                    f"`{flag.existing_lead_source_description}`"
+                )
+                computed = (
+                    f"`{flag.computed_lead_source}` / "
+                    f"`{flag.computed_lead_source_description}`"
+                )
+                add(
+                    f"| {_company_link(report.portal_id, company_id)} | {name} | "
+                    f"`{flag.kind}` | "
+                    f"{_contact_link(report.portal_id, flag.existing_contact_id)} | "
+                    f"{_contact_link(report.portal_id, flag.computed_contact_id) if flag.computed_contact_id else '(none)'} | "
+                    f"{recorded} | {computed} | {flag.reason} |"
+                )
         add("")
 
     if report.missing_primary:

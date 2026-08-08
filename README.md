@@ -1,76 +1,90 @@
 # Marketing Event Data Fill
 
-Rolls marketing-event attendance up to each contact's **primary company** and
-writes a CSV of three Target Account Tiering properties for manual review and
-import.
+Ongoing rollup: after each marketing event, Ops fills contact properties by
+hand, then runs this to recompute six **Company** properties and write a CSV
+for manual review and import.
 
-There are two separate jobs in here, and confusing them is the main way to get
-wrong numbers:
-
-| | `historical_backfill/` | `ongoing_events/` |
-|---|---|---|
-| When | Once, already run (2026-08-04) | After each new event, forever |
-| Reads | HubSpot **List membership** | The **contact properties Ops maintains** |
-| Status | Kept for reference | The one you actually run |
+A one-time historical backfill originally seeded this data from HubSpot List
+membership; that tooling has been removed — see git history if you need it.
 
 **This project never writes to HubSpot.** Output is CSV-only on purpose. You
-spot-check the file, then import it via HubSpot's import tool.
+spot-check the file, then import it via HubSpot's import tool. Contact
+properties stay permanently read-only here; keeping them current is Ops's job.
 
-| Company property | What it means |
-|---|---|
-| `marketing_event_type` | Multi-checkbox: `Channel Event Attendee` and/or `General Marketing Event Attendee` |
-| `distinct_marketing_events_attended` | Number of distinct canonical events |
-| `high_engagement_event_attendee` | `true` / `false` |
+| Company property | Internal name | Value shape |
+|---|---|---|
+| Distinct Marketing Events Attended | `distinct_marketing_events_attended` | Integer count of distinct canonical event names |
+| Marketing Event Type | `marketing_event_type` | Checkbox long labels `"Channel Event Attendee"` and/or `"General Marketing Event Attendee"`; semicolon-delimited with **no space** when both |
+| High Engagement Attendee | `high_engagement_event_attendee` | `"true"` / `"false"` |
+| First Touch Lead Source | `first_touch_lead_source` | Direct copy of the winning contact's `lead_source__deal_source` |
+| First Touch Lead Source Description | `first_touch_lead_source_description` | Direct copy of the winning contact's `lead_source_description` |
+| First Touch Contact ID | `first_touch_contact_id` | Winning contact's HubSpot ID |
+
+Intro Demo Source Description (manual, Ops-only — not computed here) follows the
+same naming convention as First Touch Lead Source Description: it holds a
+canonical event name.
 
 ---
 
-## Which part of the codebase is which
+## What Ops maintains (read-only inputs)
 
-### `historical_backfill/` — BACKFILL-ONLY, do not carry forward
-
-One-time use, already run, kept for reference and for reproducing how the
-current company values were derived.
-
-Everything List-shaped in here is **backfill-only**:
-
-- the `event_count` vs `high_engagement` **Role** distinction in the registry
-- `COUNT_HIGH_ENGAGEMENT_AS_ATTENDANCE`
-- `report_missing_primary.py` and `verify_output.py`, which both traverse Lists
-
-Why it does not carry forward: during the backfill period, List membership was
-the *only* available data source. Whether a contact had "attended" had to be
-inferred from which list they were on, and a booth-scan list had to be argued
-about separately from an attendee roster — hence the Role distinction and the
-measured decision recorded in `shared/aggregation.py`.
-
-Going forward, Ops maintains `high_engagement_attendee` **directly on the
-contact**, so that inference problem no longer exists. An event is just an
-event; the only thing that varies is its Channel/General tier. If you find
-yourself reaching for List membership, a List Role, or
-`COUNT_HIGH_ENGAGEMENT_AS_ATTENDANCE` while working on the ongoing script,
-that is backfill logic leaking somewhere it does not belong.
-
-### `ongoing_events/` — what Ops runs after each new event
-
-Per the Source Tracking System doc's Lead List Process: after an event, Ops
-fills in the contact properties, then runs this to refresh the company
-properties. Run manually — there is deliberately no scheduling or automation.
-
-Its **only** inputs are two contact properties:
-
-| Contact property | Maintained by | Shape |
+| Contact property | Internal name | Shape |
 |---|---|---|
-| `events_attended` | Ops, by hand, permanently | `"; "`-delimited canonical event names |
-| `high_engagement_attendee` | Ops, by hand, permanently | `Yes` / `No` |
+| Events Attended | `events_attended` | `"; "`-delimited canonical event names |
+| High Engagement Attendee | `high_engagement_attendee` | `Yes` / `No` |
+| Lead Source | `lead_source__deal_source` | Copied onto company First Touch when this contact wins |
+| Lead Source Description | `lead_source_description` | Same |
 
-Neither is ever written by this project. Keeping them current is Ops's job.
+None of these are ever written by this project.
 
-### `shared/` — used by both
+---
 
-`hubspot_client.py`, `aggregation.py`, `output.py`. **Changes here affect both
-consumers.** `EVENT_LISTS` and `derive_high_engagement_tiers()` in particular
-are load-bearing for output that has already been imported into HubSpot, so
-changing them changes the meaning of data that is already live.
+## Registry contract
+
+Runtime source of truth: `ongoing_events/input/marketingEventsRegistry.csv`,
+loaded by `ongoing_events/registry.py`. Code reads exactly three columns;
+everything else is Ops reference only.
+
+| Column | Used by code? | Purpose |
+|---|---|---|
+| Category | No | Ops organization |
+| Sub-category | No | Ops organization |
+| List Name | No | Historical reference to the original HubSpot List |
+| List ID | No | Historical reference |
+| **Events Attended Appendage** | **Yes — lookup key** | Exact string Ops types into a contact's Events Attended |
+| **Event Type** | **Yes** | `Channel` or `General` (mapped to the long checkbox labels above) |
+| **Event Date** | **Yes** | Earliest-event ordering for First Touch |
+| Lead Source | No | Ops reference when filling the contact's Lead Source by hand |
+| Lead Source Description | No | Ops reference when filling the contact's Lead Source Description by hand |
+
+`Events Attended Appendage` and `Lead Source Description` are often identical
+today — do not assume they always will be. Lookups use the appendage column
+only. Registry Lead Source columns are never read by code.
+
+---
+
+## How the six properties are computed
+
+Every in-scope company is a **full recompute** from all of its event-bearing
+contacts. The date flag decides which companies get touched, never which
+contacts get counted once a company is in scope.
+
+1. **Distinct Marketing Events Attended** — union of every event name on those
+   contacts; count of unique names.
+2. **Marketing Event Type** — look each distinct name up in the registry; set
+   Channel and/or General checkbox labels as above. Any name missing from the
+   registry is a **hard stop** (contact, company, and string reported; nothing
+   written).
+3. **High Engagement Attendee** — `"true"` if any contact has
+   `high_engagement_attendee=Yes`, else `"false"` (never left blank).
+4. **First Touch** — among contacts at the company, pick the one who attended
+   the earliest registry Event Date; ties break on earliest contact
+   `createdate`. Copy that contact's own Lead Source, Lead Source Description,
+   and contact ID onto the three company First Touch fields. Never a registry
+   lookup for those values.
+
+Realm itself is excluded by domain (`realm.security`) so employee attendance
+never tiers Realm as a target account.
 
 ---
 
@@ -87,12 +101,11 @@ HUBSPOT_TOKEN=pat-na1-...
 pip install requests
 ```
 
-Scopes the scripts exercise:
+Scopes the ongoing script exercises:
 
 | Scope area | Used for |
 |---|---|
-| CRM lists (read) | List membership + metadata (backfill only) |
-| CRM contacts (read) | Contact search + the Ops-maintained properties |
+| CRM contacts (read) | Contact search + Ops-maintained properties |
 | CRM associations (read) | Contact ↔ company primary resolution |
 | CRM companies (read) | Names, domains, and current property values |
 | Account info (read) | Portal ID for HubSpot deep links |
@@ -107,26 +120,21 @@ generated CSVs (they contain real contact names, emails, and job titles).
 Exactly one date flag is required:
 
 ```bash
-python ongoing_events/marketingEvent-ONGOING-CompanyFill.py --all-time
-python ongoing_events/marketingEvent-ONGOING-CompanyFill.py --since 07/01/26
-python ongoing_events/marketingEvent-ONGOING-CompanyFill.py --fy 26
-python ongoing_events/marketingEvent-ONGOING-CompanyFill.py --quarter 26 3
+python ongoing_events/company_fill.py --all-time
+python ongoing_events/company_fill.py --since 07/01/26
+python ongoing_events/company_fill.py --fy 26
+python ongoing_events/company_fill.py --quarter 26 3
 ```
 
 Realm's fiscal year starts in **February**, so FY26 is 2026-02-01 through
 2027-01-31 and FY26 Q3 is Aug–Oct 2026. `--all-time` and `--since` are
 open-ended; `--fy` and `--quarter` are bounded windows.
 
-The date flag decides **which companies get recomputed, never which contacts
-get counted**. Once a company is in scope, it is rebuilt from *all* of its
-event-bearing contacts. Recomputation is idempotent, so a wider window than
-necessary is safe, just slower.
-
 Two files land in `ongoing_events/output/YYYY-MM-DD/`:
 
 | File | Contents |
 |---|---|
-| `marketing_event_company_ongoing_fill.csv` | Import-ready rows |
+| `marketing_event_company_ongoing_fill.csv` | Import-ready rows (six company properties) |
 | `ongoing_review_report.md` | Everything needing a human |
 
 Exit codes: `0` clean, `1` hard stop (nothing written), `2` completed but the
@@ -135,95 +143,45 @@ review report has findings.
 ### What the review report can tell you
 
 1. **Unmatched event name — hard stop.** Any `events_attended` string missing
-   from the registry halts the run and names the contact, company and string.
-   Expected whenever Ops adds an event to a contact before the registry row
-   exists. Fix the registry or the contact, then re-run.
+   from the registry halts the run and names the contact, company, and string.
+   Fix the registry or the contact, then re-run.
 2. **Regressions, withheld from the CSV.** If a company computes to a lower
-   `distinct_marketing_events_attended`, loses a previously-set tier, or drops
-   from high-engagement `true`, it is flagged instead of overwritten. These
-   numbers should only grow; a shrink usually means a deleted contact or a
-   broken association.
-3. **Contacts with event data but no primary company.** Their attendance is
+   `distinct_marketing_events_attended`, loses a previously-set type checkbox,
+   or drops from high-engagement `true`, it is flagged instead of overwritten.
+3. **First Touch conflicts, withheld from the CSV.** Same withhold-and-flag
+   pattern:
+   - **Changed winner** — company already has a First Touch Contact ID, and a
+     fresh run picks a different contact.
+   - **Same winner, LS/LSD changed** — same contact wins, but that contact's
+     Lead Source or Lead Source Description no longer matches what is recorded
+     on the company.
+   In both cases the existing First Touch fields are **not** overwritten; the
+   whole company row is withheld for manual review.
+4. **Contacts with event data but no primary company.** Their attendance is
    invisible at company level until someone fixes the association.
-4. **Companies holding event properties with no event-bearing contacts.** The
-   blind spot on the other side: nothing recomputes these, so nothing watches
-   them.
-5. **Volume sanity check.** Warns when a scoped run touches most of the portal.
+5. **Companies holding event properties with no event-bearing contacts.**
+   Nothing recomputes these, so nothing watches them.
+6. **Volume sanity check.** Warns when a scoped run touches most of the portal.
 
 ### After the run
 
 1. Open the review report. Resolve anything in it before importing.
 2. Spot-check a handful of companies in the CSV against HubSpot.
-3. Import the CSV, mapping the three company properties. Multi-checkbox values
-   are semicolon-delimited — confirm that in the import preview.
-
----
-
-## Running the historical backfill (reference only)
-
-```bash
-python historical_backfill/marketingEvent-HISTORICAL-CompanyFill.py
-python historical_backfill/marketingEvent-HISTORICAL-ContactFill.py
-```
-
-One company run fetches each of the ~43 event lists **once** and does three
-things: writes the backfill CSV, writes the missing-primary report, then
-verifies a sample by traversing company → contacts → lists.
-
-Ad-hoc re-checks: `report_missing_primary.py`, `verify_output.py`.
-
----
-
-## How attendance is computed
-
-The registry `input/marketingEventsRegistry.csv` is the runtime source of
-truth, loaded by `shared/aggregation.py`. Each row is:
-
-```text
-Folder, Sub-folder, List Name, List ID, Tier, Role, Notes
-```
-
-`List Name` has its trailing ` - [List Type]` segment stripped to produce the
-**canonical event name** — the exact string that must appear in a contact's
-`events_attended`.
-
-| `Role` | Effect |
-|---|---|
-| `event_count` | Counts toward distinct events + contributes the Channel/General tier |
-| `high_engagement` | Backfill: seeds high engagement, and counts as attendance while `COUNT_HIGH_ENGAGEMENT_AS_ATTENDANCE` is on |
-| `excluded` | Validated at load, then dropped |
-
-The ongoing script reads this table through one function,
-`event_tier_lookup()`, which flattens both roles into a plain
-`canonical_event -> tier` map. It never looks anything up by List ID or Role.
-
-**Realm itself is excluded** by domain (`realm.security`) so employee
-attendance never tiers Realm as a target account.
+3. Import the CSV, mapping the six company properties. Multi-checkbox values
+   are semicolon-delimited with no space — confirm that in the import preview.
 
 ---
 
 ## Portal facts worth knowing
 
-Verified against the live portal on 2026-08-04. Several of these contradict
-what you might reasonably assume:
-
-- **`hs_lastmodifieddate` is empty on contacts here.** A `GTE` search on it
-  returns zero results for every cutoff, out to ten years. The property that
-  actually tracks record-level modification is **`lastmodifieddate`**. Filtering
-  on the wrong one produces a run that selects nothing and looks clean.
-- `lastmodifieddate` is record-level, so *any* change to a contact (email open,
-  form fill, owner change) pulls its company back into scope. Every query is
-  AND-ed with "carries event data at all" to keep the blast radius at ~2.6k
-  contacts rather than ~39.6k.
-- `marketing_event_type` options are the long labels (`Channel Event
-  Attendee`), stored `;`-delimited with **no space**. The registry's `Tier`
-  column holds the short form (`Channel`); the mapping lives in
-  `ongoing_events/ongoing_aggregation.py`.
-- Company `high_engagement_event_attendee` is a **`true`/`false`** enumeration,
-  while contact `high_engagement_attendee` is **`Yes`/`No`**.
-- The bulk contact import on 2026-08-04 reset `lastmodifieddate` on every event
-  contact, so `--since` and `--all-time` return identical sets until Ops starts
-  making changes. This is expected and resolves itself over time.
+- **`hs_lastmodifieddate` is empty on contacts here.** Use
+  **`lastmodifieddate`** for date scoping. Filtering on the wrong one produces
+  a run that selects nothing and looks clean.
+- `lastmodifieddate` is record-level, so *any* change to a contact pulls its
+  company back into scope. Every query is AND-ed with "carries event data at
+  all" to keep the blast radius down.
+- Company `high_engagement_event_attendee` is `"true"`/`"false"`; contact
+  `high_engagement_attendee` is `Yes`/`No`.
 
 ---
 
@@ -231,27 +189,23 @@ what you might reasonably assume:
 
 | Path | Role |
 |---|---|
-| `shared/hubspot_client.py` | All HubSpot API access, retries, tripwires |
-| `shared/aggregation.py` | Registry loading, tier rules, `event_tier_lookup()` |
-| `shared/output.py` | Backfill CSV writers + domain exclusion |
-| `ongoing_events/marketingEvent-ONGOING-CompanyFill.py` | Ongoing orchestrator + date flags |
-| `ongoing_events/ongoing_aggregation.py` | Ongoing company rules — pure, no API |
-| `ongoing_events/ongoing_output.py` | Ongoing CSV + review report |
-| `ongoing_events/test_ongoing_aggregation.py` | Unit tests, no token required |
-| `historical_backfill/marketingEvent-HISTORICAL-CompanyFill.py` | Backfill orchestrator |
-| `historical_backfill/marketingEvent-HISTORICAL-ContactFill.py` | Per-contact backfill |
-| `historical_backfill/report_missing_primary.py` | Backfill Ops report |
-| `historical_backfill/verify_output.py` | Backfill reverse-direction spot-check |
-| `input/marketingEventsRegistry.csv` | Runtime source of truth (gitignored) |
+| `ongoing_events/company_fill.py` | Orchestrator + date flags |
+| `ongoing_events/company_rules.py` | Company rules — pure, no API |
+| `ongoing_events/registry.py` | Registry load, `event_type_lookup()`, `event_date_lookup()`, `EXCLUDED_COMPANY_DOMAINS` |
+| `ongoing_events/hubspot_client.py` | All HubSpot API access, retries, tripwires |
+| `ongoing_events/run_output.py` | CSV + review report |
+| `ongoing_events/test_company_rules.py` | Unit tests, no token required |
+| `ongoing_events/input/marketingEventsRegistry.csv` | Runtime source of truth |
+| `ongoing_events/output/` | Per-run CSV + review report (gitignored) |
 
-Ongoing data flow:
+Data flow:
 
 ```text
 contact search (lastmodifieddate + has event data)
     → resolve_primary_companies()      # in-scope company set
     → all event-bearing contacts of those companies   # full recompute
     → compute_company_properties()     # pure, no API
-    → detect_regressions()             # vs. current HubSpot values
+    → detect_regressions() / detect_first_touch_conflicts()
     → CSV + review report
 ```
 
@@ -260,39 +214,32 @@ contact search (lastmodifieddate + has event data)
 ## Testing
 
 ```bash
-python ongoing_events/test_ongoing_aggregation.py
+python ongoing_events/test_company_rules.py
 ```
 
 Dependency-free and token-free — the aggregation math is verifiable with fake
-data, same discipline as the historical `aggregate()`.
+data.
 
 Before trusting a change against production, run `--all-time` and diff the
 output against current company properties. Every difference should be
-explainable. As of 2026-08-04 the recompute matched HubSpot on 1655 of 1693
-companies, and all 38 differences traced to two causes: 33 rows of the
-historical contact import that never landed (companies shrink; caught by the
-regression tripwire or the stranded-company check), and 58 contacts with event
-data that predate or postdate the List-based backfill (companies grow).
+explainable.
 
 ---
 
 ## Extending / maintaining
 
-**Add a new event** — append a row to `input/marketingEventsRegistry.csv`. Do
-not invent a tier. If it is a high-engagement / booth-scan list, pair it with an
-`event_count` row for the same canonical event name.
+**Add a new event** — append a row to
+`ongoing_events/input/marketingEventsRegistry.csv` with
+`Events Attended Appendage`, `Event Type` (`Channel` or `General`), and
+`Event Date`. The appendage string must match what Ops types into contacts
+exactly.
 
 **A run hard-stopped on an unmatched event name** — that is the design. Either
 the registry is missing the event, or the contact has a typo. Both need a human.
 
-**Exclude another internal domain** — add it to `EXCLUDED_COMPANY_DOMAINS`.
+**Exclude another internal domain** — add it to `EXCLUDED_COMPANY_DOMAINS` in
+`ongoing_events/registry.py`.
 
 **Primary association type** — discovered at runtime from the HubSpot-defined
 label `"Primary"` (not hardcoded). Escape hatch:
-`PRIMARY_ASSOCIATION_TYPE_ID_OVERRIDE` in `shared/hubspot_client.py`.
-
-Tripwires you should not silence without investigating: suspiciously large list
-membership (>2000), fetched count ≠ HubSpot's declared list `size`, non-contact
-`objectTypeId`, search paging hitting the 10k ceiling, a search's declared
-`total` disagreeing with the number of records collected, and any association
-batch error that is not the benign `NO_ASSOCIATIONS_FOUND`.
+`PRIMARY_ASSOCIATION_TYPE_ID_OVERRIDE` in `ongoing_events/hubspot_client.py`.

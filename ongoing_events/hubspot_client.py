@@ -2,8 +2,8 @@
 """HubSpot data access — nothing in here knows anything about marketing events.
 
 Every method calls the HubSpot API and returns data. No marketing-event business
-rules live here: no tier logic, no event names, no domain exclusions. Those are
-in aggregation.py.
+rules live here: no event-type logic, no event names, no domain exclusions.
+Those are in registry.py / company_rules.py.
 
 The API-shape findings and tripwires documented on the methods below were all
 verified against the live portal on 2026-08-03; treat the docstrings as a record
@@ -62,26 +62,37 @@ ASSOCIATIONS_BATCH_LIMIT = 1000
 # Contact properties Ops maintains by hand. Internal names confirmed against the
 # live portal 2026-08-04: events_attended is a string/textarea,
 # high_engagement_attendee is an enumeration with options Yes / No.
+# lead_source__deal_source / lead_source_description are also Ops-manual and
+# permanently read-only for this project — First Touch copies them onto the
+# company, never writes them back onto the contact.
 CONTACT_EVENTS_PROPERTY = "events_attended"
 CONTACT_HIGH_ENGAGEMENT_PROPERTY = "high_engagement_attendee"
+CONTACT_LEAD_SOURCE_PROPERTY = "lead_source__deal_source"
+CONTACT_LEAD_SOURCE_DESCRIPTION_PROPERTY = "lead_source_description"
+CONTACT_CREATEDATE_PROPERTY = "createdate"
 
 # The contact property that actually tracks record-level modification in this
 # portal. See search_contacts_modified_since() — hs_lastmodifieddate is empty on
 # contacts here and silently matches nothing.
 CONTACT_MODIFIED_PROPERTY = "lastmodifieddate"
 
-# The three company properties this project maintains. Internal names and value
-# shapes confirmed against the live portal 2026-08-04:
+# Company properties this project maintains. Internal names and value shapes for
+# the first three confirmed against the live portal 2026-08-04:
 #   marketing_event_type                enumeration/checkbox, options
 #                                       "Channel Event Attendee" and
 #                                       "General Marketing Event Attendee",
 #                                       stored ";"-delimited with no space
 #   distinct_marketing_events_attended  number
 #   high_engagement_event_attendee      enumeration/select, options true / false
+# First Touch internals match SPEC/businessLogic.md; values are direct copies
+# of the winning contact's own Lead Source / Lead Source Description / id.
 COMPANY_EVENT_PROPERTIES = [
     "marketing_event_type",
     "distinct_marketing_events_attended",
     "high_engagement_event_attendee",
+    "first_touch_lead_source",
+    "first_touch_lead_source_description",
+    "first_touch_contact_id",
 ]
 
 SEARCH_PAGE_LIMIT = 100
@@ -107,8 +118,8 @@ def _iso_utc(value: datetime) -> str:
 
 
 def load_env_files() -> None:
-    # Prefer the repo root (parent of scripts/), then scripts/ itself — after
-    # the move into scripts/, credentials stayed at the project root.
+    # Prefer the repo root (parent of ongoing_events/), then ongoing_events/
+    # itself — credentials live at the project root.
     script_dir = Path(__file__).resolve().parent
     search_dirs = (script_dir.parent, script_dir)
     for directory in search_dirs:

@@ -2,39 +2,41 @@
 """
 Ongoing marketing-event company fill — orchestrator.
 
-Keeps three Company properties current as Ops adds new event lists and fills in
-contact properties, without re-running the full historical backfill:
+Keeps six Company properties current as Ops adds new events and fills in
+contact properties:
 
     marketing_event_type
     distinct_marketing_events_attended
     high_engagement_event_attendee
+    first_touch_lead_source
+    first_touch_lead_source_description
+    first_touch_contact_id
 
-THIS IS NOT THE BACKFILL. The only inputs are the two contact properties Ops
-maintains by hand — events_attended and high_engagement_attendee. This script
-never reads List membership, never looks at a List Role, and has no notion of
-COUNT_HIGH_ENGAGEMENT_AS_ATTENDANCE. Those are backfill-only concepts (see
-historical_backfill/ and the README). It also never writes to the contact
-properties: keeping those current is permanently Ops's job.
+Inputs are contact properties Ops maintains by hand — events_attended,
+high_engagement_attendee, lead_source__deal_source, lead_source_description
+(plus createdate for First Touch tie-breaks). This script never writes to
+those contact properties: keeping them current is permanently Ops's job.
 
-Output is CSV for manual review + import, same as every script in this project.
-No write-back, no scheduling — Ops runs this by hand after each event.
+Output is CSV for manual review + import. No write-back, no scheduling —
+Ops runs this by hand after each event. Every run is a full recompute for
+in-scope companies.
 
 Usage (exactly one date flag is required):
 
-    python marketingEvent-ONGOING-CompanyFill.py --all-time
-    python marketingEvent-ONGOING-CompanyFill.py --since 07/01/26
-    python marketingEvent-ONGOING-CompanyFill.py --fy 26
-    python marketingEvent-ONGOING-CompanyFill.py --quarter 26 3
+    python ongoing_events/company_fill.py --all-time
+    python ongoing_events/company_fill.py --since 07/01/26
+    python ongoing_events/company_fill.py --fy 26
+    python ongoing_events/company_fill.py --quarter 26 3
 
 Exit codes: 0 clean, 1 hard stop (nothing written), 2 completed but the review
 report has findings. Non-zero on findings is deliberate — this runs unattended,
 so "no news is good news" has to be enforceable by the caller.
 
-The pieces live in:
-  shared/hubspot_client.py    — all API access, retries, tripwires
-  shared/aggregation.py       — the registry and event_tier_lookup()
-  ongoing_aggregation.py      — the company property rules (pure, no API)
-  ongoing_output.py           — CSV + review report
+The pieces live in ongoing_events/:
+  hubspot_client.py  — all API access, retries, tripwires
+  registry.py        — registry load, event_type_lookup() / event_date_lookup()
+  company_rules.py   — company property rules (pure, no API)
+  run_output.py      — CSV + review report
 """
 
 from __future__ import annotations
@@ -45,28 +47,33 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from shared.aggregation import (  # noqa: E402
-    EXCLUDED_COMPANY_DOMAINS,
-    AggregationError,
-    event_tier_lookup,
+from company_rules import (  # noqa: E402
+    ContactEventData,
+    OngoingAggregationError,
+    UnmatchedEventError,
+    compute_company_properties,
+    detect_first_touch_conflicts,
+    detect_regressions,
 )
-from shared.hubspot_client import (  # noqa: E402
+from hubspot_client import (  # noqa: E402
+    CONTACT_CREATEDATE_PROPERTY,
     CONTACT_EVENTS_PROPERTY,
     CONTACT_HIGH_ENGAGEMENT_PROPERTY,
+    CONTACT_LEAD_SOURCE_DESCRIPTION_PROPERTY,
+    CONTACT_LEAD_SOURCE_PROPERTY,
     HubSpotClient,
     HubSpotError,
     require_token,
 )
-
-from ongoing_aggregation import (  # noqa: E402
-    ContactEventData,
-    UnmatchedEventError,
-    compute_company_properties,
-    detect_regressions,
+from registry import (  # noqa: E402
+    EXCLUDED_COMPANY_DOMAINS,
+    AggregationError,
+    event_date_lookup,
+    event_type_lookup,
 )
-from ongoing_output import (  # noqa: E402
+from run_output import (  # noqa: E402
     CSV_FILENAME,
     REPORT_FILENAME,
     MissingPrimaryContact,
@@ -80,14 +87,18 @@ from ongoing_output import (  # noqa: E402
 # is named for the calendar year it BEGINS in.
 FISCAL_YEAR_START_MONTH = 2
 
-# Company properties read back to power the regression tripwire. Compared
-# against values computed in the same run — a stale snapshot would defeat it.
+# Company properties read back to power the regression / First Touch tripwires.
+# Compared against values computed in the same run — a stale snapshot would
+# defeat them.
 COMPANY_PROPERTIES = [
     "name",
     "domain",
     "marketing_event_type",
     "distinct_marketing_events_attended",
     "high_engagement_event_attendee",
+    "first_touch_lead_source",
+    "first_touch_lead_source_description",
+    "first_touch_contact_id",
 ]
 
 # Fraction of all event-history companies that a single scoped run can touch
@@ -270,7 +281,8 @@ def main(argv: list[str] | None = None) -> int:
         # the whole run.
         report.portal_id = None
 
-    tier_lookup = event_tier_lookup()
+    tier_lookup = event_type_lookup()
+    date_lookup = event_date_lookup()
     print(f"Scope: {scope_label}")
     print(f"Registry covers {len(tier_lookup)} canonical event names.\n")
 
@@ -326,6 +338,9 @@ def main(argv: list[str] | None = None) -> int:
         [
             CONTACT_EVENTS_PROPERTY,
             CONTACT_HIGH_ENGAGEMENT_PROPERTY,
+            CONTACT_LEAD_SOURCE_PROPERTY,
+            CONTACT_LEAD_SOURCE_DESCRIPTION_PROPERTY,
+            CONTACT_CREATEDATE_PROPERTY,
             "firstname",
             "lastname",
             "email",
@@ -388,6 +403,14 @@ def main(argv: list[str] | None = None) -> int:
                     CONTACT_HIGH_ENGAGEMENT_PROPERTY
                 )
                 or "",
+                lead_source=contact_props.get(cid, {}).get(CONTACT_LEAD_SOURCE_PROPERTY)
+                or "",
+                lead_source_description=contact_props.get(cid, {}).get(
+                    CONTACT_LEAD_SOURCE_DESCRIPTION_PROPERTY
+                )
+                or "",
+                createdate=contact_props.get(cid, {}).get(CONTACT_CREATEDATE_PROPERTY)
+                or "",
             )
             for cid in sorted(contacts_by_company_all[company_id])
         ]
@@ -395,7 +418,9 @@ def main(argv: list[str] | None = None) -> int:
     }
 
     try:
-        profiles = compute_company_properties(contacts_by_company, tier_lookup)
+        profiles = compute_company_properties(
+            contacts_by_company, tier_lookup, date_lookup
+        )
     except UnmatchedEventError as exc:
         report.unmatched_error = exc
         report_path = write_review_report(report, {}, {}, out_dir / REPORT_FILENAME)
@@ -403,8 +428,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nNo CSV written. Review report: {report_path}", file=sys.stderr)
         return 1
 
-    # Phase 5 — read back what HubSpot currently holds, for the regression
-    # tripwire and for the company name/domain columns.
+    first_touch_computed = sum(
+        1 for p in profiles.values() if p.first_touch_contact_id
+    )
+    print(
+        f"  First Touch computed for {first_touch_computed} of "
+        f"{len(profiles)} in-scope companies."
+    )
+
+    # Phase 5 — read back what HubSpot currently holds, for the regression /
+    # First Touch tripwires and for the company name/domain columns.
     print(f"\nPhase 5 — reading current values for {len(profiles)} companies...")
     companies = client.batch_read_companies(sorted(profiles), COMPANY_PROPERTIES)
 
@@ -416,11 +449,21 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
 
+    report.first_touch_flags = detect_first_touch_conflicts(profiles, companies)
+    if report.first_touch_flags:
+        print(
+            f"\n  !! {len(report.first_touch_flags)} company(ies) have a First "
+            f"Touch conflict — withheld from the CSV for manual review.",
+            file=sys.stderr,
+        )
+
+    withheld = set(report.regressions) | set(report.first_touch_flags)
+
     # Phase 6 — write.
     write_company_csv(
         profiles,
         companies,
-        withheld_company_ids=set(report.regressions),
+        withheld_company_ids=withheld,
         excluded_domains=EXCLUDED_COMPANY_DOMAINS,
         out_path=out_dir / CSV_FILENAME,
         report=report,
@@ -429,8 +472,10 @@ def main(argv: list[str] | None = None) -> int:
 
     print("-" * 68)
     print(f"Companies in scope:                  {report.in_scope_company_count}")
+    print(f"First Touch computed:                {first_touch_computed}")
     print(f"Rows written to CSV:                 {report.written_company_count}")
-    print(f"Withheld (regression tripwire):      {report.withheld_company_count}")
+    print(f"Withheld (regression tripwire):      {len(report.regressions)}")
+    print(f"Withheld (First Touch conflict):     {len(report.first_touch_flags)}")
     print(f"Excluded (Realm domain):             {len(report.excluded_by_domain)}")
     print(f"Contacts with no primary company:    {len(report.missing_primary)}")
     print(f"Companies with no event contacts:    {len(report.stranded_companies)}")
@@ -447,6 +492,6 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (HubSpotError, AggregationError) as exc:
+    except (HubSpotError, AggregationError, OngoingAggregationError) as exc:
         print(f"\nFATAL — {exc}", file=sys.stderr)
         sys.exit(1)
