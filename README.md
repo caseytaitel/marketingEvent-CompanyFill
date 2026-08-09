@@ -9,7 +9,7 @@ membership; that tooling has been removed — see git history if you need it.
 
 **This project never writes to HubSpot.** Output is CSV-only on purpose. You
 spot-check the file, then import it via HubSpot's import tool. Contact
-properties stay permanently read-only here; keeping them current is Ops's job.
+properties stay permanently read-only here; keeping them current is Ops's job (see What Ops maintains below).
 
 | Company property | Internal name | Value shape |
 |---|---|---|
@@ -19,10 +19,6 @@ properties stay permanently read-only here; keeping them current is Ops's job.
 | First Touch Lead Source | `first_touch_lead_source` | Direct copy of the winning contact's `lead_source__deal_source` |
 | First Touch Lead Source Description | `first_touch_lead_source_description` | Direct copy of the winning contact's `lead_source_description` |
 | First Touch Contact ID | `first_touch_contact_id` | Winning contact's HubSpot ID |
-
-Intro Demo Source Description (manual, Ops-only — not computed here) follows the
-same naming convention as First Touch Lead Source Description: it holds a
-canonical event name.
 
 ---
 
