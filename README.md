@@ -1,15 +1,13 @@
 # Marketing Event Data Fill
 
-Ongoing rollup: after each marketing event, Ops fills contact properties by
+After each marketing event, Ops fills contact properties by
 hand, then runs this to recompute three **Company** properties and write a CSV
 for manual review and import.
 
 A one-time historical backfill originally seeded this data from HubSpot List
 membership; that tooling has been removed — see git history if you need it.
 
-**This project never writes to HubSpot.** Output is CSV-only on purpose. You
-spot-check the file, then import it via HubSpot's import tool. Contact
-properties stay permanently read-only here; keeping them current is Ops's job (see What Ops maintains below).
+**This project does not write to HubSpot.** Output is CSV-only. Spot-check the file, then import it via HubSpot's import tool. 
 
 | Company property | Internal name | Value shape |
 |---|---|---|
@@ -25,8 +23,6 @@ properties stay permanently read-only here; keeping them current is Ops's job (s
 |---|---|---|
 | Events Attended | `events_attended` | `"; "`-delimited canonical event names |
 | High Engagement Attendee | `high_engagement_attendee` | `Yes` / `No` |
-
-None of these are ever written by this project.
 
 ---
 
