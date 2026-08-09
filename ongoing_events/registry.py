@@ -6,27 +6,32 @@ Source of truth: ongoing_events/input/marketingEventsRegistry.csv. Code reads:
   Events Attended Appendage  — lookup key (matches contact events_attended)
   Event Type                 — Channel | General
   Event Date                 — earliest-event ordering for First Touch
+                               (parsed via date_scope.try_parse_ops_date)
   Lead Source                — classification only: whether a contact's own
                                Lead Source is an "event" registry value for
                                First Touch effective-date selection. Never
                                copied onto the company.
 
 Everything else in the CSV is Ops reference only and is ignored here.
+Load failures raise RegistryError.
 """
 
 from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 
+from date_scope import try_parse_ops_date
 
-class AggregationError(RuntimeError):
-    """Raised when the registry can't support the configured rules.
 
-    Separate from HubSpotError so this module stays free of any dependency on
-    the API layer; callers catch both.
+class RegistryError(RuntimeError):
+    """Raised when the registry CSV can't support the configured rules.
+
+    Registry-owned (load / column / date problems). Separate from HubSpotError
+    and from company_rules.OngoingAggregationError so each layer has one
+    failure type; company_fill catches all three at the top level.
     """
 
 
@@ -57,16 +62,13 @@ class EventRegistryEntry:
 
 
 def _parse_event_date(raw: str, *, path: Path, row_num: int) -> date:
-    cleaned = (raw or "").strip()
-    for fmt in ("%m/%d/%y", "%m/%d/%Y", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(cleaned, fmt).date()
-        except ValueError:
-            continue
-    raise AggregationError(
-        f"Registry CSV {path} row {row_num}: Event Date {raw!r} is not a "
-        f"recognised date (expected MM/DD/YY)"
-    )
+    parsed = try_parse_ops_date(raw)
+    if parsed is None:
+        raise RegistryError(
+            f"Registry CSV {path} row {row_num}: Event Date {raw!r} is not a "
+            f"recognised date (expected MM/DD/YY)"
+        )
+    return parsed
 
 
 def load_event_registry(
@@ -86,7 +88,7 @@ def load_event_registry(
         if reader.fieldnames is None or not _REQUIRED_COLUMNS.issubset(
             set(reader.fieldnames)
         ):
-            raise AggregationError(
+            raise RegistryError(
                 f"Registry CSV {path} missing required columns; got "
                 f"{reader.fieldnames!r}, need at least {sorted(_REQUIRED_COLUMNS)}"
             )
@@ -98,14 +100,14 @@ def load_event_registry(
                 continue
 
             if event_name in loaded:
-                raise AggregationError(
+                raise RegistryError(
                     f"Registry CSV {path} row {row_num}: duplicate Events "
                     f"Attended Appendage {event_name!r}"
                 )
 
             event_type = (row.get("Event Type") or "").strip()
             if event_type not in _VALID_EVENT_TYPES:
-                raise AggregationError(
+                raise RegistryError(
                     f"Registry CSV {path} row {row_num} ({event_name!r}): "
                     f"Event Type must be one of {sorted(_VALID_EVENT_TYPES)}, "
                     f"got {event_type!r}"
@@ -113,7 +115,7 @@ def load_event_registry(
 
             lead_source = (row.get("Lead Source") or "").strip()
             if not lead_source:
-                raise AggregationError(
+                raise RegistryError(
                     f"Registry CSV {path} row {row_num} ({event_name!r}): "
                     f"blank Lead Source (needed for First Touch classification)"
                 )
@@ -129,7 +131,7 @@ def load_event_registry(
             )
 
     if not loaded:
-        raise AggregationError(f"Registry CSV {path} contained no event rows")
+        raise RegistryError(f"Registry CSV {path} contained no event rows")
 
     return loaded
 

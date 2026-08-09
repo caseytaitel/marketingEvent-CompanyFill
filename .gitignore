@@ -2,7 +2,6 @@
 .env*
 
 # Generated output — contains real contact names, emails, and job titles
-# (contacts_missing_primary_company.csv especially)
 output/
 input/
 

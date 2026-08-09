@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CSV + review-report output for the ongoing company fill.
 
-Three files per run, under output/YYYY-MM-DD/:
+Three files per run, under output/YYYY-MM-DD/ (same-day runs overwrite):
 
   marketing_event_company_ongoing_fill.csv
       Import-ready. Contains only companies that are safe to overwrite —
@@ -52,7 +52,6 @@ MAIN_CSV_FIELDNAMES = [
     "first_touch_lead_source_description",
     "first_touch_contact_id",
     "events_attended",
-    "contributing_contact_count",
 ]
 
 WITHHELD_CSV_FIELDNAMES = MAIN_CSV_FIELDNAMES + ["flag_reason"]
@@ -88,7 +87,6 @@ class RunReport:
     total_event_company_count: int = 0
     written_company_count: int = 0
     excluded_by_domain: list[tuple[str, str]] = field(default_factory=list)
-    withheld_company_count: int = 0
     withheld_review_company_count: int = 0
     volume_warning: str | None = None
     unmatched_error: UnmatchedEventError | None = None
@@ -163,7 +161,6 @@ def _company_csv_row(
         # readability; the property columns above use the portal's exact
         # ";" form.
         "events_attended": "; ".join(sorted(profile.events)),
-        "contributing_contact_count": len(profile.contributing_contacts),
     }
 
 
@@ -182,6 +179,23 @@ def flag_reason_for_company(company_id: str, report: RunReport) -> str:
         if tie.company_id == company_id:
             parts.append(UNDECIDED_FIRST_TOUCH_REASON)
     return "; ".join(parts)
+
+
+def _record_if_excluded_domain(
+    company_id: str,
+    companies: dict[str, dict],
+    lowered_excluded: set[str],
+    report: RunReport,
+) -> bool:
+    """If domain is excluded, append to report and return True (skip the row)."""
+    props = companies.get(company_id, {})
+    domain = (props.get("domain") or "").strip().lower()
+    if domain not in lowered_excluded:
+        return False
+    report.excluded_by_domain.append(
+        (company_id, props.get("name") or "(no name)")
+    )
+    return True
 
 
 def write_company_csv(
@@ -207,18 +221,14 @@ def write_company_csv(
         for company_id, profile in sorted(profiles.items(), key=lambda kv: kv[0]):
             if company_id in withheld_company_ids:
                 continue
-            props = companies.get(company_id, {})
-            domain = (props.get("domain") or "").strip().lower()
-            if domain in lowered_excluded:
-                report.excluded_by_domain.append(
-                    (company_id, props.get("name") or "(no name)")
-                )
+            if _record_if_excluded_domain(
+                company_id, companies, lowered_excluded, report
+            ):
                 continue
             writer.writerow(_company_csv_row(company_id, profile, companies))
             report.written_company_count += 1
 
     report.csv_path = out_path
-    report.withheld_company_count = len(withheld_company_ids)
 
 
 def write_withheld_companies_csv(
@@ -244,14 +254,11 @@ def write_withheld_companies_csv(
         writer = csv.DictWriter(f, fieldnames=WITHHELD_CSV_FIELDNAMES)
         writer.writeheader()
         for company_id in sorted(withheld_company_ids):
-            props = companies.get(company_id, {})
-            domain = (props.get("domain") or "").strip().lower()
-            if domain in lowered_excluded:
-                # Same list the main CSV uses — a withheld Realm company never
-                # reaches the main writer's domain check, so record it here.
-                report.excluded_by_domain.append(
-                    (company_id, props.get("name") or "(no name)")
-                )
+            # A withheld Realm company never reaches the main writer's domain
+            # check, so record the exclusion here.
+            if _record_if_excluded_domain(
+                company_id, companies, lowered_excluded, report
+            ):
                 continue
             profile = profiles.get(company_id)
             if profile is None:

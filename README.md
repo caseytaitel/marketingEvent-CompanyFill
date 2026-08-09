@@ -161,6 +161,9 @@ Three files land in `ongoing_events/output/YYYY-MM-DD/`:
 | `withheld_companies_review.csv` | Same shape as the main CSV plus `flag_reason` — one full computed row per company withheld for a regression, First Touch conflict, or undecided tertiary tie (mutually exclusive with the main CSV) |
 | `ongoing_review_report.md` | Everything needing a human |
 
+A second run on the same calendar day overwrites that day's folder. Copy or
+rename the directory if you need to keep an earlier run for comparison.
+
 Exit codes: `0` clean, `1` hard stop (nothing written), `2` completed but the
 review report has findings.
 
@@ -218,24 +221,27 @@ review report has findings.
 
 | Path | Role |
 |---|---|
-| `ongoing_events/company_fill.py` | Orchestrator + date flags |
-| `ongoing_events/company_rules.py` | Company rules — pure, no API |
-| `ongoing_events/registry.py` | Registry load, `event_type_lookup()`, `event_date_lookup()`, `EXCLUDED_COMPANY_DOMAINS` |
-| `ongoing_events/hubspot_client.py` | All HubSpot API access, retries, tripwires |
+| `ongoing_events/company_fill.py` | Orchestrator — sequences the run, no business math |
+| `ongoing_events/date_scope.py` | CLI date flags / fiscal window; shared Ops date parsing (no API) |
+| `ongoing_events/company_rules.py` | Company rules — pure, no API (`OngoingAggregationError`) |
+| `ongoing_events/registry.py` | Registry load, lookups, `EXCLUDED_COMPANY_DOMAINS` (`RegistryError`) |
+| `ongoing_events/hubspot_client.py` | All HubSpot API access, retries, tripwires (`HubSpotError`; owns `COMPANY_READ_PROPERTIES`) |
 | `ongoing_events/run_output.py` | CSV + review report |
-| `ongoing_events/test_company_rules.py` | Unit tests, no token required |
+| `ongoing_events/test_company_rules.py` | Unit tests for rules, no token required |
+| `ongoing_events/test_run_output.py` | Unit tests for CSV helpers, no token required |
 | `ongoing_events/input/marketingEventsRegistry.csv` | Runtime source of truth |
 | `ongoing_events/output/` | Per-run CSV + review report (gitignored) |
 
 Data flow:
 
 ```text
-contact search (lastmodifieddate + has event data)
-    → resolve_primary_companies()      # in-scope company set
-    → all event-bearing contacts of those companies   # full recompute
-    → compute_company_properties()     # pure, no API
+date_scope flags
+    → contact search (lastmodifieddate + has event data)
+    → resolve_primary_companies()           # universe → in-scope companies
+    → First Touch extras (non-event contacts at those companies)
+    → compute_company_properties()          # pure, no API; full recompute
     → detect_regressions() / detect_first_touch_conflicts()
-    → CSV + review report
+    → main CSV + withheld CSV + review report
 ```
 
 ---
@@ -244,10 +250,11 @@ contact search (lastmodifieddate + has event data)
 
 ```bash
 python ongoing_events/test_company_rules.py
+python ongoing_events/test_run_output.py
 ```
 
-Dependency-free and token-free — the aggregation math is verifiable with fake
-data.
+Dependency-free and token-free — the aggregation math and CSV helpers are
+verifiable with fake data.
 
 Before trusting a change against production, run `--all-time` and diff the
 output against current company properties. Every difference should be
@@ -272,3 +279,9 @@ the registry is missing the event, or the contact has a typo. Both need a human.
 **Primary association type** — discovered at runtime from the HubSpot-defined
 label `"Primary"` (not hardcoded). Escape hatch:
 `PRIMARY_ASSOCIATION_TYPE_ID_OVERRIDE` in `ongoing_events/hubspot_client.py`.
+
+**Fatal error types** (caught at the top of `company_fill.py`):
+`HubSpotError` (API), `RegistryError` (registry CSV), and
+`OngoingAggregationError` (rules hard-stops such as unbreakable First Touch
+ties). Unmatched event names are `UnmatchedEventError` (a rules subclass) and
+exit `1` with a review report and no CSV.

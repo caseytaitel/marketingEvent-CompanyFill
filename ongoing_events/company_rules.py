@@ -65,7 +65,11 @@ FIRST_TOUCH_LEAD_SOURCE_DESCRIPTION = "first_touch_lead_source_description"
 
 
 class OngoingAggregationError(RuntimeError):
-    """Base for problems that should stop a run rather than be worked around."""
+    """Base for company-rules problems that should stop a run.
+
+    Rules-owned (unmatched events, unbreakable First Touch ties). Separate from
+    registry.RegistryError and hubspot_client.HubSpotError.
+    """
 
 
 @dataclass(frozen=True)

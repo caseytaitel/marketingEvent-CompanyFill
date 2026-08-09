@@ -32,12 +32,6 @@ HUBSPOT_BASE = "https://api.hubapi.com"
 MAX_RETRIES = 3
 RETRY_BASE_DELAY_SEC = 2.0
 
-# Contacts with a membership count above this on a single list trigger a
-# loud warning in the run log. We hit a silent-failure bug earlier this
-# project where a list-membership query returned ~40k results instead of a
-# few dozen — this is a tripwire against that class of bug recurring here.
-SUSPICIOUS_LIST_SIZE = 2000
-
 # The contact->company association we treat as "primary" is identified by this
 # HubSpot-defined label. See discover_primary_association_type_id() for why the
 # label (not "the only HUBSPOT_DEFINED entry") is the correct discriminator.
@@ -76,16 +70,12 @@ CONTACT_CREATEDATE_PROPERTY = "createdate"
 # contacts here and silently matches nothing.
 CONTACT_MODIFIED_PROPERTY = "lastmodifieddate"
 
-# Company properties this project maintains. Internal names and value shapes for
-# the first three confirmed against the live portal 2026-08-04:
-#   marketing_event_type                enumeration/checkbox, options
-#                                       "Channel Event Attendee" and
-#                                       "General Marketing Event Attendee",
-#                                       stored ";"-delimited with no space
-#   distinct_marketing_events_attended  number
-#   high_engagement_event_attendee      enumeration/select, options true / false
-# First Touch internals match SPEC/businessLogic.md; values are direct copies
-# of the winning contact's own Lead Source / Lead Source Description / id.
+# The six company properties this project maintains. Single source of truth for
+# search filters and for the batch-read that powers tripwires / CSV columns.
+# Value shapes (confirmed live portal 2026-08-04): marketing_event_type is a
+# multi-checkbox stored ";"-delimited with no space; distinct count is a number;
+# high_engagement_event_attendee is true/false; First Touch fields are direct
+# copies of the winning contact's Lead Source / Lead Source Description / id.
 COMPANY_EVENT_PROPERTIES = [
     "marketing_event_type",
     "distinct_marketing_events_attended",
@@ -94,6 +84,9 @@ COMPANY_EVENT_PROPERTIES = [
     "first_touch_lead_source_description",
     "first_touch_contact_id",
 ]
+
+# Batch-read shape for in-scope companies: identity fields + event properties.
+COMPANY_READ_PROPERTIES = ["name", "domain", *COMPANY_EVENT_PROPERTIES]
 
 SEARCH_PAGE_LIMIT = 100
 # HubSpot's search API refuses to page beyond 10k results. Treated as a hard
@@ -113,7 +106,7 @@ def _iso_utc(value: datetime) -> str:
 
 
 # ---------------------------------------------------------------------------
-# .env loader (no external dependency, matches find_dupes.py)
+# .env loader (stdlib only — no python-dotenv dependency)
 # ---------------------------------------------------------------------------
 
 
@@ -182,10 +175,6 @@ class HubSpotClient:
             {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         )
         self._primary_association_type_id: int | None = None
-        # Instrumentation: how many times each list's membership was pulled over
-        # this client's lifetime. Lets a caller prove membership was fetched once
-        # per list rather than once per consuming script.
-        self.list_membership_fetch_counts: dict[int, int] = {}
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict:
         url = f"{HUBSPOT_BASE}{path}"
@@ -210,99 +199,28 @@ class HubSpotClient:
                 return {}
             return resp.json()
 
+    @staticmethod
+    def _partition_association_errors(
+        errors: list[dict] | None,
+        *,
+        is_benign,
+    ) -> tuple[list[dict], list[dict]]:
+        """Split association batch errors into (benign, unexpected)."""
+        benign: list[dict] = []
+        unexpected: list[dict] = []
+        for err in errors or []:
+            if is_benign(err):
+                benign.append(err)
+            else:
+                unexpected.append(err)
+        return benign, unexpected
+
     # -- account ----------------------------------------------------------
     def get_portal_id(self) -> str:
         """Portal (hub) ID, used to build app.hubspot.com deep links."""
         return str(self._request("GET", "/account-info/v3/details").get("portalId"))
 
-    # -- list membership -----------------------------------------------
-    def get_list_detail(self, list_id: int) -> dict:
-        """Return the list's metadata. Used for the declared-'size' cross-check
-        in get_list_membership, and to confirm the list is a CONTACT list.
-        """
-        data = self._request("GET", f"/crm/v3/lists/{list_id}")
-        detail = data.get("list")
-        if not isinstance(detail, dict):
-            raise HubSpotError(
-                f"List {list_id} detail response missing 'list' object. Raw: {data!r}"
-            )
-        return detail
-
-    def get_list_membership(self, list_id: int) -> list[str]:
-        """Return contact record IDs on a static list.
-
-        VERIFIED 2026-08-03 against the live portal: the assumed shape was
-        correct. Responses are
-        {"results": [{"recordId": "...", "membershipTimestamp": "..."}],
-         "paging": {"next": {"after": ...}}}
-        with limit=250 accepted. recordId comes back as a string. No parsing
-        change was needed. Error handling below is intentionally strict about
-        shape mismatches — we already hit one silent list-membership failure
-        this project (list 912 via a different query path).
-        """
-        self.list_membership_fetch_counts[list_id] = (
-            self.list_membership_fetch_counts.get(list_id, 0) + 1
-        )
-        contact_ids: list[str] = []
-        after: str | None = None
-        while True:
-            params: dict[str, Any] = {"limit": 250}
-            if after:
-                params["after"] = after
-            data = self._request(
-                "GET", f"/crm/v3/lists/{list_id}/memberships", params=params
-            )
-            if "results" not in data:
-                raise HubSpotError(
-                    f"List {list_id} membership response missing 'results' key. "
-                    f"Raw response: {data!r}. Verify the endpoint/shape before proceeding."
-                )
-            for row in data["results"]:
-                rid = row.get("recordId")
-                if rid is None:
-                    raise HubSpotError(
-                        f"List {list_id} membership row missing 'recordId'. Row: {row!r}"
-                    )
-                contact_ids.append(str(rid))
-            after = ((data.get("paging") or {}).get("next") or {}).get("after")
-            if not after:
-                break
-
-        if len(contact_ids) > SUSPICIOUS_LIST_SIZE:
-            print(
-                f"  !! WARNING: list {list_id} returned {len(contact_ids)} contacts — "
-                f"that's suspiciously large for a single event list. STOP and verify "
-                f"this is real list membership, not an unfiltered pull, before trusting "
-                f"downstream numbers. (We hit exactly this failure mode earlier in this "
-                f"project via a different query path.)",
-                file=sys.stderr,
-            )
-
-        # Tighter tripwire than the size threshold above: HubSpot tells us how
-        # many records it thinks are on the list, so a mismatch means our
-        # paging dropped or duplicated rows. Verified to match on all 42 lists.
-        detail = self.get_list_detail(list_id)
-        declared = detail.get("size")
-        if declared is not None and int(declared) != len(contact_ids):
-            print(
-                f"  !! WARNING: list {list_id} ('{detail.get('name')}') declares "
-                f"size={declared} but we fetched {len(contact_ids)} contacts "
-                f"({len(set(contact_ids))} unique). Paging may be dropping or "
-                f"repeating records — verify against the list in HubSpot before "
-                f"trusting this run.",
-                file=sys.stderr,
-            )
-        if detail.get("objectTypeId") not in (None, "0-1"):
-            print(
-                f"  !! WARNING: list {list_id} has objectTypeId="
-                f"{detail.get('objectTypeId')!r}, which is not the contact type "
-                f"('0-1'). recordIds from it are NOT contact IDs and the primary-"
-                f"company resolution below will be meaningless for this list.",
-                file=sys.stderr,
-            )
-        return contact_ids
-
-    # -- contact search (ongoing_events/) --------------------------------
+    # -- contact search -------------------------------------------------
     def search_contacts_modified_since(
         self,
         cutoff_date: datetime | None,
@@ -619,14 +537,16 @@ class HubSpotClient:
                 json={"inputs": [{"id": cid} for cid in chunk]},
             )
 
-            unexpected: list[dict] = []
-            for err in data.get("errors") or []:
-                if err.get("subCategory") == NO_ASSOCIATIONS_SUBCATEGORY:
-                    out.contacts_with_no_company.update(
-                        str(x) for x in (err.get("context", {}).get("fromObjectId") or [])
-                    )
-                else:
-                    unexpected.append(err)
+            benign, unexpected = self._partition_association_errors(
+                data.get("errors"),
+                is_benign=lambda err: err.get("subCategory")
+                == NO_ASSOCIATIONS_SUBCATEGORY,
+            )
+            for err in benign:
+                out.contacts_with_no_company.update(
+                    str(x)
+                    for x in (err.get("context", {}).get("fromObjectId") or [])
+                )
             if unexpected:
                 raise HubSpotError(
                     f"Association batch/read returned {len(unexpected)} error(s) that are "
@@ -713,33 +633,6 @@ class HubSpotClient:
 
         return mapping
 
-    # -- single-record associations (used for reverse-direction checks) ----
-    def get_company_contact_ids(self, company_id: str) -> list[str]:
-        """Contacts associated with a company (company -> contacts direction)."""
-        data = self._request(
-            "GET",
-            f"/crm/v4/objects/companies/{company_id}/associations/contacts",
-            params={"limit": 500},
-        )
-        return [str(row.get("toObjectId")) for row in data.get("results", [])]
-
-    def get_contact_company_associations(
-        self, contact_id: str
-    ) -> list[tuple[str, list[int]]]:
-        """One contact's company associations as (company_id, [type_ids]) pairs."""
-        data = self._request(
-            "GET",
-            f"/crm/v4/objects/contacts/{contact_id}/associations/companies",
-            params={"limit": 100},
-        )
-        return [
-            (
-                str(row.get("toObjectId")),
-                [at.get("typeId") for at in (row.get("associationTypes") or [])],
-            )
-            for row in data.get("results", [])
-        ]
-
     # -- object details ---------------------------------------------------
     def _batch_read_objects(
         self, object_type: str, ids: list[str], properties: list[str]
@@ -804,13 +697,20 @@ class HubSpotClient:
                         to_id = str(to_row.get("toObjectId") or (to_row.get("to") or {}).get("id") or "")
                         if to_id:
                             out[from_id].append(to_id)
-            for err in data.get("errors") or []:
-                sub = (err.get("subCategory") or err.get("category") or "")
-                if NO_ASSOCIATIONS_SUBCATEGORY not in str(sub) and "NO_ASSOCIATIONS" not in str(sub):
-                    # Non-benign association errors should not be silent.
-                    raise HubSpotError(
-                        f"company->contact association batch error: {err!r}"
-                    )
+            _, unexpected = self._partition_association_errors(
+                data.get("errors"),
+                is_benign=lambda err: (
+                    NO_ASSOCIATIONS_SUBCATEGORY
+                    in str(err.get("subCategory") or err.get("category") or "")
+                    or "NO_ASSOCIATIONS"
+                    in str(err.get("subCategory") or err.get("category") or "")
+                ),
+            )
+            if unexpected:
+                # Non-benign association errors should not be silent.
+                raise HubSpotError(
+                    f"company->contact association batch error: {unexpected[0]!r}"
+                )
         return out
 
     def batch_read_contact_property_history(
