@@ -12,10 +12,10 @@ Three files per run, under output/YYYY-MM-DD/ (same-day runs overwrite):
       row per withheld company — mutually exclusive with the main CSV.
 
   ongoing_review_report.md
-      Everything that needs a human. This script runs unattended after each
-      event, so "it printed a warning somewhere in the scrollback" is not good
-      enough — if a run needs attention, opening this one file has to be
-      sufficient to find out why.
+      Run summary plus findings that are not company rows in the withheld
+      CSV (unmatched events, missing primary, stranded companies, etc.).
+      Regressions / First Touch conflicts / undecided ties live in
+      withheld_companies_review.csv — not duplicated here.
 
 CSV only. This project does not write back to HubSpot; you review the file,
 then import it via HubSpot's import tool.
@@ -51,7 +51,7 @@ MAIN_CSV_FIELDNAMES = [
     "first_touch_lead_source",
     "first_touch_lead_source_description",
     "first_touch_contact_id",
-    "events_attended",
+    "distinct_events_attended",
 ]
 
 WITHHELD_CSV_FIELDNAMES = MAIN_CSV_FIELDNAMES + ["flag_reason"]
@@ -160,7 +160,7 @@ def _company_csv_row(
         # Audit trail only — not a company property. Uses "; " for
         # readability; the property columns above use the portal's exact
         # ";" form.
-        "events_attended": "; ".join(sorted(profile.events)),
+        "distinct_events_attended": "; ".join(sorted(profile.events)),
     }
 
 
@@ -283,11 +283,13 @@ def write_withheld_companies_csv(
 
 def write_review_report(
     report: RunReport,
-    companies: dict[str, dict],
-    profiles: dict[str, CompanyEventProfile],
     out_path: Path,
 ) -> Path:
-    """Write the human-facing report. Always written, even on a clean run."""
+    """Write the human-facing report. Always written, even on a clean run.
+
+    Withheld company rows (regressions, First Touch conflicts, undecided ties)
+    are not listed here — they live in withheld_companies_review.csv.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     lines: list[str] = []
     add = lines.append
@@ -315,6 +317,14 @@ def write_review_report(
     if report.withheld_csv_path:
         add(f"- **Withheld review CSV:** `{report.withheld_csv_path.name}`")
     add("")
+
+    if report.withheld_review_company_count:
+        add(
+            "Withheld companies (regressions, First Touch conflicts, and "
+            "undecided ties) are in the withheld review CSV — open that file "
+            "to review them."
+        )
+        add("")
 
     if not report.needs_attention:
         add("## Nothing needs attention")
@@ -346,80 +356,6 @@ def write_review_report(
             )
         add("")
 
-    if report.regressions:
-        add("## Regressions withheld from the CSV")
-        add("")
-        add(
-            f"{len(report.regressions)} company(ies) computed to a LOWER value than "
-            "HubSpot currently holds. These numbers should only grow, so a shrink "
-            "usually means a deleted contact or a broken association rather than a "
-            "real change. They were **withheld from the import CSV** — verify each "
-            "one, then either fix the underlying data and re-run, or update the "
-            "company by hand."
-        )
-        add("")
-        add("| Company | Name | Property | Currently in HubSpot | Computed | Why flagged |")
-        add("|---|---|---|---|---|---|")
-        for company_id, flags in sorted(report.regressions.items()):
-            name = (companies.get(company_id, {}) or {}).get("name") or "(no name)"
-            for flag in flags:
-                add(
-                    f"| {_company_link(report.portal_id, company_id)} | {name} | "
-                    f"`{flag.property_name}` | `{flag.existing_value}` | "
-                    f"`{flag.computed_value}` | {flag.reason} |"
-                )
-        add("")
-        add("Events currently computed for each flagged company:")
-        add("")
-        for company_id in sorted(report.regressions):
-            profile = profiles.get(company_id)
-            if profile is None:
-                continue
-            events = "; ".join(sorted(profile.events)) or "(none)"
-            add(
-                f"- {company_id}: {len(profile.contributing_contacts)} contributing "
-                f"contact(s) — {events}"
-            )
-        add("")
-
-    if report.first_touch_flags:
-        add("## First Touch conflicts withheld from the CSV")
-        add("")
-        add(
-            f"{len(report.first_touch_flags)} company(ies) already have a First "
-            "Touch Contact ID recorded, and a fresh full recompute disagrees with "
-            "what HubSpot holds — either a different winning contact, or the same "
-            "contact with a changed Lead Source / Lead Source Description. First "
-            "Touch fields were **not overwritten**; the whole company row was "
-            "withheld from the import CSV for manual review (same withhold-and-flag "
-            "shape as the regression tripwire)."
-        )
-        add("")
-        add(
-            "| Company | Name | Kind | Recorded contact | Computed contact | "
-            "Recorded LS / LSD | Computed LS / LSD | Why flagged |"
-        )
-        add("|---|---|---|---|---|---|---|---|")
-        for company_id, flags in sorted(report.first_touch_flags.items()):
-            name = (companies.get(company_id, {}) or {}).get("name") or "(no name)"
-            for flag in flags:
-                recorded = (
-                    f"`{flag.existing_lead_source}` / "
-                    f"`{flag.existing_lead_source_description}`"
-                )
-                computed = (
-                    f"`{flag.computed_lead_source}` / "
-                    f"`{flag.computed_lead_source_description}`"
-                )
-                add(
-                    f"| {_company_link(report.portal_id, company_id)} | {name} | "
-                    f"`{flag.kind}` | "
-                    f"{_contact_link(report.portal_id, flag.existing_contact_id)} | "
-                    f"{_contact_link(report.portal_id, flag.computed_contact_id) if flag.computed_contact_id else '(none)'} | "
-                    f"{recorded} | {computed} | {flag.reason} |"
-                )
-        add("")
-
     if report.zero_history_first_touch:
         add("## First Touch: Lead Source set but no usable property history")
         add("")
@@ -438,47 +374,6 @@ def write_review_report(
                 f"- contact {_contact_link(report.portal_id, item.contact_id)} "
                 f"(company {_company_link(report.portal_id, item.company_id)}) — "
                 f"Lead Source `{item.lead_source}`"
-            )
-        add("")
-
-    if report.undecided_first_touch_ties:
-        add("## First Touch: undecided ties withheld from the CSV")
-        add("")
-        add(
-            f"{len(report.undecided_first_touch_ties)} company(ies) have two or "
-            "more First Touch candidates tied on both effective date and "
-            "`createdate` (typical of contacts created in the same bulk import), "
-            "and none of those contacts is the company's currently recorded "
-            "First Touch Contact ID. No winner was chosen; the whole company row "
-            "was withheld from the import CSV for manual review."
-        )
-        add("")
-        add(
-            "| Company | Name | Effective date | createdate | Tied contacts | "
-            "Recorded FT contact |"
-        )
-        add("|---|---|---|---|---|---|")
-        for item in sorted(
-            report.undecided_first_touch_ties,
-            key=lambda t: t.company_id,
-        ):
-            name = (companies.get(item.company_id, {}) or {}).get("name") or (
-                "(no name)"
-            )
-            tied = ", ".join(
-                _contact_link(report.portal_id, cid) for cid in item.contact_ids
-            )
-            recorded = (
-                _contact_link(
-                    report.portal_id, item.recorded_first_touch_contact_id
-                )
-                if item.recorded_first_touch_contact_id
-                else "(none)"
-            )
-            add(
-                f"| {_company_link(report.portal_id, item.company_id)} | {name} | "
-                f"`{item.effective_date.isoformat()}` | `{item.createdate}` | "
-                f"{tied} | {recorded} |"
             )
         add("")
 

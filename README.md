@@ -155,7 +155,7 @@ Three files land in `ongoing_events/output/YYYY-MM-DD/`:
 |---|---|
 | `marketing_event_company_ongoing_fill.csv` | Import-ready rows (six company properties) |
 | `withheld_companies_review.csv` | Same shape as the main CSV plus `flag_reason` — one full computed row per company withheld for a regression, First Touch conflict, or undecided tertiary tie (mutually exclusive with the main CSV) |
-| `ongoing_review_report.md` | Everything needing a human |
+| `ongoing_review_report.md` | Run summary plus findings that are not company rows in the withheld CSV |
 
 A second run on the same calendar day overwrites that day's folder. Copy or
 rename the directory if you need to keep an earlier run for comparison.
@@ -168,34 +168,31 @@ review report has findings.
 1. **Unmatched event name — hard stop.** Any `events_attended` string missing
    from the registry halts the run and names the contact, company, and string.
    Fix the registry or the contact, then re-run.
-2. **Regressions, withheld from the CSV.** If a company computes to a lower
-   `distinct_marketing_events_attended`, loses a previously-set type checkbox,
-   or drops from high-engagement `true`, it is flagged instead of overwritten.
-3. **First Touch conflicts, withheld from the CSV.** Same withhold-and-flag
-   pattern:
-   - **Changed winner** — company already has a First Touch Contact ID, and a
-     fresh run picks a different contact.
-   - **Same winner, LS/LSD changed** — same contact wins, but that contact's
-     Lead Source or Lead Source Description no longer matches what is recorded
-     on the company.
-   In both cases the existing First Touch fields are **not** overwritten; the
-   whole company row is withheld for manual review.
-4. **Contacts with event data but no primary company.** Their attendance is
+2. **Contacts with event data but no primary company.** Their attendance is
    invisible at company level until someone fixes the association.
-5. **Companies holding event properties with no event-bearing contacts.**
+3. **Companies holding event properties with no event-bearing contacts.**
    Nothing recomputes these, so nothing watches them.
-6. **Volume sanity check.** Warns when a scoped run touches most of the portal.
+4. **First Touch: Lead Source set but no usable property history.** Contact
+   left out of First Touch for the run — not silently skipped.
+5. **Volume sanity check.** Warns when a scoped run touches most of the portal.
+
+Regressions, First Touch conflicts, and undecided tertiary ties are **not**
+listed in the review report — open `withheld_companies_review.csv` (each row's
+`flag_reason` explains why it was withheld).
 
 ### After the run
 
-1. Open the review report. Resolve anything in it before importing.
+1. Open the review report for non-CSV findings, and
+   `withheld_companies_review.csv` for withheld company rows.
 2. Spot-check a handful of companies in the CSV against HubSpot.
 3. Import the CSV, mapping the six company properties. Multi-checkbox values
    are semicolon-delimited with no space — confirm that in the import preview.
+   Skip review-only columns (`company_name`, `company_domain`,
+   `distinct_events_attended`).
 4. For withheld companies: open `withheld_companies_review.csv`, delete the
    rows you're not ready to accept, and import what's left with the same
-   property mapping as the main CSV (`flag_reason` is review-only — skip it
-   on import).
+   property mapping as the main CSV (`flag_reason` and
+   `distinct_events_attended` are review-only — skip them on import).
 
 ---
 

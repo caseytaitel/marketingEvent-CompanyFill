@@ -386,9 +386,7 @@ def write_run_outputs(
         out_path=out_dir / WITHHELD_CSV_FILENAME,
         report=report,
     )
-    return write_review_report(
-        report, companies, profiles, out_dir / REPORT_FILENAME
-    )
+    return write_review_report(report, out_dir / REPORT_FILENAME)
 
 
 def print_run_summary(
@@ -524,7 +522,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if not in_scope_companies:
         print("\nNo companies fell in scope for this window — nothing to recompute.")
-        write_review_report(report, {}, {}, out_dir / REPORT_FILENAME)
+        write_review_report(report, out_dir / REPORT_FILENAME)
         print(f"Review report: {out_dir / REPORT_FILENAME}")
         return 2 if report.needs_attention else 0
 
@@ -581,9 +579,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     except UnmatchedEventError as exc:
         report.unmatched_error = exc
-        report_path = write_review_report(
-            report, companies, {}, out_dir / REPORT_FILENAME
-        )
+        report_path = write_review_report(report, out_dir / REPORT_FILENAME)
         print(f"\nFATAL — {exc}", file=sys.stderr)
         print(f"\nNo CSV written. Review report: {report_path}", file=sys.stderr)
         return 1
