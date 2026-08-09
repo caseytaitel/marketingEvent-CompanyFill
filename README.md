@@ -44,29 +44,22 @@ everything else is Ops reference only.
 | Lead Source | No | Ops still fills this by hand; unused by code |
 | Lead Source Description | No | Ops reference when filling the contact's Lead Source Description by hand |
 
-`Events Attended Appendage` and `Lead Source Description` are often identical
-today — do not assume they always will be. Lookups use the appendage column
-for identity.
-
 ---
 
 ## How the three properties are computed
 
 Every in-scope company is a **full recompute** from all of its event-bearing
-contacts. The date flag decides which companies get touched, never which
-contacts get counted once a company is in scope.
+contacts. 
 
 1. **Distinct Marketing Events Attended** — union of every event name on those
    contacts; count of unique names.
 2. **Marketing Event Type** — look each distinct name up in the registry; set
    Channel and/or General checkbox labels as above. Any name missing from the
-   registry is a **hard stop** (contact, company, and string reported; nothing
-   written).
+   registry is a **hard stop**.
 3. **High Engagement Attendee** — `"true"` if any contact has
    `high_engagement_attendee=Yes`, else `"false"` (never left blank).
 
-Realm itself is excluded by domain (`realm.security`) so employee attendance
-never tiers Realm as a target account. That exclusion applies to both output
+Realm itself is excluded by domain (`realm.security`) in both output
 CSVs — the main import file and `withheld_companies_review.csv`.
 
 ---
@@ -148,14 +141,10 @@ explains why it was withheld).
 1. Open the review report for non-CSV findings, and
    `withheld_companies_review.csv` for withheld company rows (if present).
 2. Spot-check a handful of companies in the CSV against HubSpot.
-3. Import the CSV, mapping the three company properties. Multi-checkbox values
-   are semicolon-delimited with no space — confirm that in the import preview.
-   Skip review-only columns (`company_name`, `company_domain`,
-   `distinct_events_attended`).
+3. Import the CSV, mapping the three company properties.
 4. For withheld companies: open `withheld_companies_review.csv`, delete the
    rows you're not ready to accept, and import what's left with the same
-   property mapping as the main CSV (`flag_reason` and
-   `distinct_events_attended` are review-only — skip them on import).
+   property mapping as the main CSV.
 
 ---
 
@@ -167,8 +156,6 @@ explains why it was withheld).
 - `lastmodifieddate` is record-level, so *any* change to a contact pulls its
   company back into scope. Every query is AND-ed with "carries event data at
   all" to keep the blast radius down.
-- Company `high_engagement_event_attendee` is `"true"`/`"false"`; contact
-  `high_engagement_attendee` is `Yes`/`No`.
 
 ---
 
@@ -176,7 +163,7 @@ explains why it was withheld).
 
 | Path | Role |
 |---|---|
-| `ongoing_events/company_fill.py` | Orchestrator — sequences the run, no business math |
+| `ongoing_events/company_fill.py` | Orchestrator — sequences the run |
 | `ongoing_events/date_scope.py` | CLI date flags / fiscal window; shared Ops date parsing (no API) |
 | `ongoing_events/company_rules.py` | Company rules — pure, no API (`OngoingAggregationError`) |
 | `ongoing_events/registry.py` | Registry load, lookups, `EXCLUDED_COMPANY_DOMAINS` (`RegistryError`) |
