@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CSV + review-report output for the ongoing company fill.
 
-Three files per run, under output/YYYY-MM-DD/ (same-day runs overwrite):
+Files land under output/YYYY-MM-DD/ (same-day runs overwrite that folder):
 
   marketing_event_company_ongoing_fill.csv
       Import-ready. Contains only companies that are safe to overwrite —
@@ -10,6 +10,8 @@ Three files per run, under output/YYYY-MM-DD/ (same-day runs overwrite):
   withheld_companies_review.csv
       Same column shape as the main CSV plus flag_reason. One full computed
       row per withheld company — mutually exclusive with the main CSV.
+      Written only when at least one company is withheld; otherwise omitted
+      (and any leftover same-day file is deleted).
 
   ongoing_review_report.md
       Run summary plus findings that are not company rows in the withheld
@@ -210,7 +212,17 @@ def write_withheld_companies_csv(
     withheld_company_ids are written here. Domain exclusion matches the main
     CSV — a Realm-domain company is not written to either file. Stranded
     companies and no-primary contacts are not in this set.
+
+    If nothing would be written, the file is not created and any leftover
+    same-day file at out_path is deleted.
     """
+    if not withheld_company_ids:
+        if out_path.exists():
+            out_path.unlink()
+        report.withheld_csv_path = None
+        report.withheld_review_company_count = 0
+        return
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     lowered_excluded = {d.lower() for d in excluded_domains}
     written = 0
@@ -241,6 +253,14 @@ def write_withheld_companies_csv(
             row["flag_reason"] = reason
             writer.writerow(row)
             written += 1
+
+    if written == 0:
+        # Every withheld ID was domain-excluded — do not leave a header-only file.
+        if out_path.exists():
+            out_path.unlink()
+        report.withheld_csv_path = None
+        report.withheld_review_company_count = 0
+        return
 
     report.withheld_csv_path = out_path
     report.withheld_review_company_count = written

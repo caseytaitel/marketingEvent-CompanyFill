@@ -215,6 +215,23 @@ def test_realm_domain_excluded_from_both_csvs() -> None:
     assert ("WITHHELD_REALM", "Realm Withheld") in report.excluded_by_domain
 
 
+def test_withheld_csv_omitted_when_empty_and_stale_file_deleted() -> None:
+    """No withholdings → no file; leftover same-day file is removed."""
+    profiles = {"OK": _profile("OK")}
+    companies = {"OK": {"name": "Ok Co", "domain": "ok.example"}}
+    report = _report()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        withheld_path = Path(tmp) / "withheld.csv"
+        withheld_path.write_text("stale leftover\n", encoding="utf-8")
+        write_withheld_companies_csv(
+            profiles, companies, set(), set(), withheld_path, report
+        )
+        assert not withheld_path.exists()
+        assert report.withheld_csv_path is None
+        assert report.withheld_review_company_count == 0
+
+
 def test_main_and_withheld_csv_ids_never_overlap() -> None:
     profiles = {
         "R1": _profile("R1"),

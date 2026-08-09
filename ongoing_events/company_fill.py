@@ -24,9 +24,8 @@ Usage (exactly one date flag is required):
     python ongoing_events/company_fill.py --fy 26
     python ongoing_events/company_fill.py --quarter 26 3
 
-Exit codes: 0 clean, 1 hard stop (nothing written), 2 completed but the review
-report has findings. Non-zero on findings is deliberate — this runs unattended,
-so "no news is good news" has to be enforceable by the caller.
+Exit codes: 0 completed (clean or with findings to review), 1 hard stop
+(nothing written).
 
 The pieces live in ongoing_events/:
   date_scope.py      — CLI date flags / fiscal window; shared Ops date parsing
@@ -256,12 +255,13 @@ def print_run_summary(
     print(f"Companies with no event contacts:    {len(report.stranded_companies)}")
     print("-" * 68)
     print(f"\nCSV:                  {report.csv_path}")
-    print(f"Withheld review CSV:  {report.withheld_csv_path}")
+    if report.withheld_csv_path:
+        print(f"Withheld review CSV:  {report.withheld_csv_path}")
     print(f"Review report:        {report_path}")
     if report.needs_attention:
         print("\nThis run has findings — read the review report before importing.")
-        return 2
-    print("\nNothing flagged. Spot-check a few companies, then import the CSV.")
+    else:
+        print("\nNothing flagged. Spot-check a few companies, then import the CSV.")
     return 0
 
 
@@ -362,7 +362,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\nNo companies fell in scope for this window — nothing to recompute.")
         write_review_report(report, out_dir / REPORT_FILENAME)
         print(f"Review report: {out_dir / REPORT_FILENAME}")
-        return 2 if report.needs_attention else 0
+        return 0
 
     apply_volume_warning(
         report, all_time=args.all_time, in_scope_companies=in_scope_companies
