@@ -117,19 +117,20 @@ Realm's fiscal year starts in **February**, so FY26 is 2026-02-01 through
 2027-01-31 and FY26 Q3 is Aug–Oct 2026. `--all-time` and `--since` are
 open-ended; `--fy` and `--quarter` are bounded windows.
 
-Three files land in `ongoing_events/output/YYYY-MM-DD/`:
+Output lands in `ongoing_events/output/YYYY-MM-DD/`. A second run on the
+same calendar day **overwrites** that day's folder (including deleting a
+stale `withheld_companies_review.csv` when the new run has no withholdings).
+Copy or rename the directory if you need to keep an earlier run for
+comparison.
 
 | File | Contents |
 |---|---|
 | `marketing_event_company_ongoing_fill.csv` | Import-ready rows (three company properties) |
-| `withheld_companies_review.csv` | Same shape as the main CSV plus `flag_reason` — one full computed row per company withheld for a regression (mutually exclusive with the main CSV) |
+| `withheld_companies_review.csv` | Same shape as the main CSV plus `flag_reason` — one full computed row per company withheld for a regression (mutually exclusive with the main CSV). **Only written when at least one company is withheld**; otherwise omitted. |
 | `ongoing_review_report.md` | Run summary plus findings that are not company rows in the withheld CSV |
 
-A second run on the same calendar day overwrites that day's folder. Copy or
-rename the directory if you need to keep an earlier run for comparison.
-
-Exit codes: `0` clean, `1` hard stop (nothing written), `2` completed but the
-review report has findings.
+Exit codes: `0` completed (clean or with findings to review), `1` hard stop
+(nothing written).
 
 ### What the review report can tell you
 
@@ -143,13 +144,13 @@ review report has findings.
 4. **Volume sanity check.** Warns when a scoped run touches most of the portal.
 
 Regressions are **not** listed in the review report — open
-`withheld_companies_review.csv` (each row's `flag_reason` explains why it was
-withheld).
+`withheld_companies_review.csv` when it exists (each row's `flag_reason`
+explains why it was withheld).
 
 ### After the run
 
 1. Open the review report for non-CSV findings, and
-   `withheld_companies_review.csv` for withheld company rows.
+   `withheld_companies_review.csv` for withheld company rows (if present).
 2. Spot-check a handful of companies in the CSV against HubSpot.
 3. Import the CSV, mapping the three company properties. Multi-checkbox values
    are semicolon-delimited with no space — confirm that in the import preview.
