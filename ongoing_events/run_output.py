@@ -5,7 +5,7 @@ Three files per run, under output/YYYY-MM-DD/ (same-day runs overwrite):
 
   marketing_event_company_ongoing_fill.csv
       Import-ready. Contains only companies that are safe to overwrite —
-      anything the regression / First Touch tripwires flagged is withheld.
+      anything the regression tripwire flagged is withheld.
 
   withheld_companies_review.csv
       Same column shape as the main CSV plus flag_reason. One full computed
@@ -14,8 +14,8 @@ Three files per run, under output/YYYY-MM-DD/ (same-day runs overwrite):
   ongoing_review_report.md
       Run summary plus findings that are not company rows in the withheld
       CSV (unmatched events, missing primary, stranded companies, etc.).
-      Regressions / First Touch conflicts / undecided ties live in
-      withheld_companies_review.csv — not duplicated here.
+      Regressions live in withheld_companies_review.csv — not duplicated
+      here.
 
 CSV only. This project does not write back to HubSpot; you review the file,
 then import it via HubSpot's import tool.
@@ -30,11 +30,8 @@ from pathlib import Path
 
 from company_rules import (
     CompanyEventProfile,
-    FirstTouchFlag,
     RegressionFlag,
-    UndecidedFirstTouchTie,
     UnmatchedEventError,
-    ZeroHistoryFirstTouchContact,
 )
 
 CSV_FILENAME = "marketing_event_company_ongoing_fill.csv"
@@ -48,21 +45,10 @@ MAIN_CSV_FIELDNAMES = [
     "marketing_event_type",
     "distinct_marketing_events_attended",
     "high_engagement_event_attendee",
-    "first_touch_lead_source",
-    "first_touch_lead_source_description",
-    "first_touch_contact_id",
     "distinct_events_attended",
 ]
 
 WITHHELD_CSV_FIELDNAMES = MAIN_CSV_FIELDNAMES + ["flag_reason"]
-
-# Mirrors the review-report phrasing for undecided tertiary ties (that case
-# has no per-flag .reason field the way regressions / FT conflicts do).
-UNDECIDED_FIRST_TOUCH_REASON = (
-    "First Touch candidates tied on both effective date and createdate; "
-    "none of those contacts is the company's currently recorded First Touch "
-    "Contact ID; no winner was chosen"
-)
 
 
 @dataclass
@@ -91,13 +77,6 @@ class RunReport:
     volume_warning: str | None = None
     unmatched_error: UnmatchedEventError | None = None
     regressions: dict[str, list[RegressionFlag]] = field(default_factory=dict)
-    first_touch_flags: dict[str, list[FirstTouchFlag]] = field(default_factory=dict)
-    zero_history_first_touch: list[ZeroHistoryFirstTouchContact] = field(
-        default_factory=list
-    )
-    undecided_first_touch_ties: list[UndecidedFirstTouchTie] = field(
-        default_factory=list
-    )
     missing_primary: list[MissingPrimaryContact] = field(default_factory=list)
     stranded_companies: dict[str, dict] = field(default_factory=dict)
     csv_path: Path | None = None
@@ -109,9 +88,6 @@ class RunReport:
         return bool(
             self.unmatched_error
             or self.regressions
-            or self.first_touch_flags
-            or self.zero_history_first_touch
-            or self.undecided_first_touch_ties
             or self.missing_primary
             or self.volume_warning
             or self.stranded_companies
@@ -152,11 +128,6 @@ def _company_csv_row(
             profile.distinct_marketing_events_attended
         ),
         "high_engagement_event_attendee": profile.high_engagement_event_attendee,
-        "first_touch_lead_source": profile.first_touch_lead_source,
-        "first_touch_lead_source_description": (
-            profile.first_touch_lead_source_description
-        ),
-        "first_touch_contact_id": profile.first_touch_contact_id,
         # Audit trail only — not a company property. Uses "; " for
         # readability; the property columns above use the portal's exact
         # ";" form.
@@ -167,17 +138,11 @@ def _company_csv_row(
 def flag_reason_for_company(company_id: str, report: RunReport) -> str:
     """Combine every withhold reason for one company into a single cell.
 
-    Reuses the existing human-readable `.reason` strings from regression /
-    First Touch flags, plus the review-report phrasing for undecided ties.
+    Reuses the existing human-readable `.reason` strings from regression flags.
     """
     parts: list[str] = []
     for flag in report.regressions.get(company_id, []):
         parts.append(flag.reason)
-    for flag in report.first_touch_flags.get(company_id, []):
-        parts.append(flag.reason)
-    for tie in report.undecided_first_touch_ties:
-        if tie.company_id == company_id:
-            parts.append(UNDECIDED_FIRST_TOUCH_REASON)
     return "; ".join(parts)
 
 
@@ -287,8 +252,8 @@ def write_review_report(
 ) -> Path:
     """Write the human-facing report. Always written, even on a clean run.
 
-    Withheld company rows (regressions, First Touch conflicts, undecided ties)
-    are not listed here — they live in withheld_companies_review.csv.
+    Withheld company rows (regressions) are not listed here — they live in
+    withheld_companies_review.csv.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     lines: list[str] = []
@@ -320,9 +285,8 @@ def write_review_report(
 
     if report.withheld_review_company_count:
         add(
-            "Withheld companies (regressions, First Touch conflicts, and "
-            "undecided ties) are in the withheld review CSV — open that file "
-            "to review them."
+            "Withheld companies (regressions) are in the withheld review CSV "
+            "— open that file to review them."
         )
         add("")
 
@@ -330,9 +294,9 @@ def write_review_report(
         add("## Nothing needs attention")
         add("")
         add(
-            "No unmatched event names, no regressions, no First Touch conflicts, "
-            "no contacts stranded without a primary company, and the run size "
-            "looked normal. The CSV is ready to spot-check and import."
+            "No unmatched event names, no regressions, no contacts stranded "
+            "without a primary company, and the run size looked normal. The "
+            "CSV is ready to spot-check and import."
         )
         add("")
 
@@ -353,27 +317,6 @@ def write_review_report(
                 f"- `{unmatched.event_name}` — contact "
                 f"{_contact_link(report.portal_id, unmatched.contact_id)}, company "
                 f"{_company_link(report.portal_id, unmatched.company_id)}"
-            )
-        add("")
-
-    if report.zero_history_first_touch:
-        add("## First Touch: Lead Source set but no usable property history")
-        add("")
-        add(
-            f"{len(report.zero_history_first_touch)} contact(s) have a non-event "
-            "Lead Source filled in, but `propertiesWithHistory` returned no "
-            "non-empty revision to date them. They were excluded from First Touch "
-            "competition for this run (not silently counted as blank)."
-        )
-        add("")
-        for item in sorted(
-            report.zero_history_first_touch,
-            key=lambda z: (z.company_id, z.contact_id),
-        ):
-            add(
-                f"- contact {_contact_link(report.portal_id, item.contact_id)} "
-                f"(company {_company_link(report.portal_id, item.company_id)}) — "
-                f"Lead Source `{item.lead_source}`"
             )
         add("")
 
@@ -427,7 +370,7 @@ def write_review_report(
             "its properties by hand."
         )
         add("")
-        add("| Company | Name | Distinct events | Type | High engagement |")
+        add("| Company | Name | Distinct events | Marketing event type | High engagement |")
         add("|---|---|---|---|---|")
         for company_id, props in sorted(report.stranded_companies.items()):
             add(

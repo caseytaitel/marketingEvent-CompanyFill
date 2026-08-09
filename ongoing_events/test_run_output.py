@@ -18,7 +18,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from company_rules import (  # noqa: E402
     CompanyEventProfile,
-    FirstTouchFlag,
     RegressionFlag,
 )
 from run_output import (  # noqa: E402
@@ -34,17 +33,11 @@ def _profile(
     *,
     events: set[str] | None = None,
     tiers: set[str] | None = None,
-    ft_contact: str = "",
-    ft_ls: str = "",
-    ft_lsd: str = "",
     contributing: list[str] | None = None,
 ) -> CompanyEventProfile:
     p = CompanyEventProfile(company_id)
     p.events = events or {"Alpha Summit - NYC - 01/01/26"}
     p.tiers = tiers or {"General"}
-    p.first_touch_contact_id = ft_contact
-    p.first_touch_lead_source = ft_ls
-    p.first_touch_lead_source_description = ft_lsd
     p.contributing_contacts = contributing or ["c1"]
     return p
 
@@ -64,8 +57,8 @@ def _read_csv(path: Path) -> list[dict[str, str]]:
 
 def test_withheld_csv_regression_only() -> None:
     profiles = {
-        "R1": _profile("R1", ft_contact="p1", ft_ls="Marketing - A", ft_lsd="Alpha"),
-        "OK": _profile("OK", ft_contact="p2", ft_ls="Marketing - A", ft_lsd="Alpha"),
+        "R1": _profile("R1"),
+        "OK": _profile("OK"),
     }
     companies = {
         "R1": {"name": "Regress Co", "domain": "regress.example"},
@@ -109,67 +102,10 @@ def test_withheld_csv_regression_only() -> None:
     )
 
 
-def test_withheld_csv_first_touch_conflict_only() -> None:
-    profiles = {
-        "F1": _profile(
-            "F1",
-            ft_contact="p_new",
-            ft_ls="Marketing - New",
-            ft_lsd="Alpha Summit - NYC - 01/01/26",
-        ),
-    }
-    companies = {"F1": {"name": "FT Co", "domain": "ft.example"}}
-    report = _report(
-        first_touch_flags={
-            "F1": [
-                FirstTouchFlag(
-                    company_id="F1",
-                    kind="changed_winner",
-                    existing_contact_id="p_old",
-                    computed_contact_id="p_new",
-                    existing_lead_source="Marketing - Old",
-                    computed_lead_source="Marketing - New",
-                    existing_lead_source_description="Something Else",
-                    computed_lead_source_description="Alpha Summit - NYC - 01/01/26",
-                    reason=(
-                        "computed First Touch contact p_new differs from "
-                        "recorded p_old"
-                    ),
-                )
-            ]
-        }
-    )
-    withheld = {"F1"}
-
-    with tempfile.TemporaryDirectory() as tmp:
-        main_path = Path(tmp) / "main.csv"
-        withheld_path = Path(tmp) / "withheld.csv"
-        write_company_csv(
-            profiles, companies, withheld, set(), main_path, report
-        )
-        write_withheld_companies_csv(
-            profiles, companies, withheld, set(), withheld_path, report
-        )
-        assert _read_csv(main_path) == []
-        withheld_rows = _read_csv(withheld_path)
-
-    assert len(withheld_rows) == 1
-    row = withheld_rows[0]
-    assert row["company_id"] == "F1"
-    assert row["first_touch_contact_id"] == "p_new"
-    assert row["first_touch_lead_source"] == "Marketing - New"
-    assert row["flag_reason"] == (
-        "computed First Touch contact p_new differs from recorded p_old"
-    )
-
-
 def test_withheld_csv_both_reasons_one_row() -> None:
     profiles = {
         "B1": _profile(
             "B1",
-            ft_contact="p_new",
-            ft_ls="Marketing - New",
-            ft_lsd="Alpha",
             contributing=["c1", "c2"],
         ),
     }
@@ -193,24 +129,6 @@ def test_withheld_csv_both_reasons_one_row() -> None:
                 ),
             ]
         },
-        first_touch_flags={
-            "B1": [
-                FirstTouchFlag(
-                    company_id="B1",
-                    kind="changed_winner",
-                    existing_contact_id="p_old",
-                    computed_contact_id="p_new",
-                    existing_lead_source="Marketing - Old",
-                    computed_lead_source="Marketing - New",
-                    existing_lead_source_description="Old",
-                    computed_lead_source_description="Alpha",
-                    reason=(
-                        "computed First Touch contact p_new differs from "
-                        "recorded p_old"
-                    ),
-                )
-            ]
-        },
     )
     withheld = {"B1"}
 
@@ -225,8 +143,7 @@ def test_withheld_csv_both_reasons_one_row() -> None:
     reason = withheld_rows[0]["flag_reason"]
     assert reason == (
         "count dropped by 1; "
-        "previously-set tier disappeared: Channel Event Attendee; "
-        "computed First Touch contact p_new differs from recorded p_old"
+        "previously-set tier disappeared: Channel Event Attendee"
     )
     # Combined reason helper agrees with the cell.
     assert flag_reason_for_company("B1", report) == reason
@@ -301,12 +218,12 @@ def test_realm_domain_excluded_from_both_csvs() -> None:
 def test_main_and_withheld_csv_ids_never_overlap() -> None:
     profiles = {
         "R1": _profile("R1"),
-        "F1": _profile("F1", ft_contact="p_new", ft_ls="LS", ft_lsd="D"),
-        "OK": _profile("OK", ft_contact="p_ok", ft_ls="LS", ft_lsd="D"),
+        "R2": _profile("R2"),
+        "OK": _profile("OK"),
     }
     companies = {
         "R1": {"name": "R", "domain": "r.example"},
-        "F1": {"name": "F", "domain": "f.example"},
+        "R2": {"name": "F", "domain": "f.example"},
         "OK": {"name": "O", "domain": "o.example"},
     }
     report = _report(
@@ -319,28 +236,20 @@ def test_main_and_withheld_csv_ids_never_overlap() -> None:
                     "1",
                     "count dropped by 1",
                 )
-            ]
-        },
-        first_touch_flags={
-            "F1": [
-                FirstTouchFlag(
-                    company_id="F1",
-                    kind="changed_winner",
-                    existing_contact_id="p_old",
-                    computed_contact_id="p_new",
-                    existing_lead_source="Old",
-                    computed_lead_source="LS",
-                    existing_lead_source_description="Old",
-                    computed_lead_source_description="D",
-                    reason=(
-                        "computed First Touch contact p_new differs from "
-                        "recorded p_old"
-                    ),
+            ],
+            "R2": [
+                RegressionFlag(
+                    "R2",
+                    "high_engagement_event_attendee",
+                    "true",
+                    "false",
+                    "company is currently flagged high-engagement but no "
+                    "associated contact has high_engagement_attendee=Yes",
                 )
-            ]
+            ],
         },
     )
-    withheld = {"R1", "F1"}
+    withheld = {"R1", "R2"}
 
     with tempfile.TemporaryDirectory() as tmp:
         main_path = Path(tmp) / "main.csv"
@@ -355,7 +264,7 @@ def test_main_and_withheld_csv_ids_never_overlap() -> None:
         withheld_ids = {r["company_id"] for r in _read_csv(withheld_path)}
 
     assert main_ids == {"OK"}
-    assert withheld_ids == {"R1", "F1"}
+    assert withheld_ids == {"R1", "R2"}
     assert main_ids.isdisjoint(withheld_ids)
 
 

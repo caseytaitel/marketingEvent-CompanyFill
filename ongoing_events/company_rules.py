@@ -8,15 +8,8 @@ test_company_rules.py.
 Input is the contact properties Ops maintains by hand (read-only here):
   events_attended              free-text, "; "-delimited canonical event names
   high_engagement_attendee     "Yes" / "No" / blank
-  lead_source__deal_source     copied onto company First Touch when this
-                               contact wins; also classifies First Touch
-                               effective-date path (registry vs history)
-  lead_source_description      same
-  createdate                   tie-break when two contacts share the earliest
-                               effective date; identical createdate falls
-                               through to the recorded First Touch Contact ID
 
-Output is the six company properties, already in the exact string form the
+Output is the three company properties, already in the exact string form the
 HubSpot property options use, so a CSV cell can be compared byte-for-byte
 against what the portal currently holds.
 """
@@ -24,8 +17,6 @@ against what the portal currently holds.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
-from typing import Any
 
 # Registry types are "Channel" / "General"; the HubSpot property options are the
 # longer labels below. Confirmed against the live portal 2026-08-04 by reading
@@ -58,17 +49,12 @@ CONTACT_HIGH_ENGAGEMENT_YES = "Yes"
 HIGH_ENGAGEMENT_TRUE = "true"
 HIGH_ENGAGEMENT_FALSE = "false"
 
-# Company First Touch property internal names (for flag comparison keys).
-FIRST_TOUCH_CONTACT_ID = "first_touch_contact_id"
-FIRST_TOUCH_LEAD_SOURCE = "first_touch_lead_source"
-FIRST_TOUCH_LEAD_SOURCE_DESCRIPTION = "first_touch_lead_source_description"
-
 
 class OngoingAggregationError(RuntimeError):
     """Base for company-rules problems that should stop a run.
 
-    Rules-owned (unmatched events, unbreakable First Touch ties). Separate from
-    registry.RegistryError and hubspot_client.HubSpotError.
+    Rules-owned (unmatched events). Separate from registry.RegistryError and
+    hubspot_client.HubSpotError.
     """
 
 
@@ -79,9 +65,6 @@ class ContactEventData:
     contact_id: str
     events_attended: str = ""
     high_engagement_attendee: str = ""
-    lead_source: str = ""
-    lead_source_description: str = ""
-    createdate: str = ""
 
 
 @dataclass(frozen=True)
@@ -128,16 +111,13 @@ class UnmatchedEventError(OngoingAggregationError):
 
 @dataclass
 class CompanyEventProfile:
-    """The six company property values, plus the audit trail behind them."""
+    """The three company property values, plus the audit trail behind them."""
 
     company_id: str
     events: set[str] = field(default_factory=set)
     tiers: set[str] = field(default_factory=set)
     high_engagement_contacts: list[str] = field(default_factory=list)
     contributing_contacts: list[str] = field(default_factory=list)
-    first_touch_contact_id: str = ""
-    first_touch_lead_source: str = ""
-    first_touch_lead_source_description: str = ""
 
     @property
     def distinct_marketing_events_attended(self) -> int:
@@ -165,201 +145,14 @@ def split_events(raw: str) -> list[str]:
     return [part.strip() for part in (raw or "").split(CONTACT_EVENTS_DELIMITER) if part.strip()]
 
 
-def parse_contact_createdate(raw: str) -> datetime:
-    """Parse a HubSpot contact createdate into an aware UTC datetime.
-
-    Accepts ISO-8601 (with or without trailing Z / offset) and millisecond
-    epoch strings. Raises ValueError if the value is empty or unparseable —
-    a missing createdate on a tied winner is a data problem, not something to
-    silently invent an order for.
-    """
-    cleaned = (raw or "").strip()
-    if not cleaned:
-        raise ValueError("empty createdate")
-    if cleaned.isdigit():
-        ms = int(cleaned)
-        # HubSpot sometimes returns seconds; treat 10-digit as seconds.
-        if ms < 1_000_000_000_000:
-            return datetime.fromtimestamp(ms, tz=timezone.utc)
-        return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
-    normalised = cleaned.replace("Z", "+00:00")
-    try:
-        parsed = datetime.fromisoformat(normalised)
-    except ValueError as exc:
-        raise ValueError(f"unparseable createdate {raw!r}") from exc
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
-def earliest_nonempty_history_date(entries: list[dict[str, Any]]) -> date | None:
-    """Oldest non-empty value's calendar date from a propertiesWithHistory list.
-
-    HubSpot returns history newest-first; this scans every entry and takes the
-    minimum timestamp among those with a non-empty value. Clears (`""`) do not
-    count. Returns None when there is no usable entry.
-    """
-    best: datetime | None = None
-    for entry in entries:
-        value = (entry.get("value") or "").strip()
-        if not value:
-            continue
-        raw_ts = entry.get("timestamp")
-        if not raw_ts:
-            continue
-        try:
-            ts = parse_contact_createdate(str(raw_ts))
-        except ValueError:
-            continue
-        if best is None or ts < best:
-            best = ts
-    return best.date() if best is not None else None
-
-
-@dataclass(frozen=True)
-class ZeroHistoryFirstTouchContact:
-    """Case-2 contact with Lead Source set but no usable property history."""
-
-    company_id: str
-    contact_id: str
-    lead_source: str
-
-
-@dataclass(frozen=True)
-class UndecidedFirstTouchTie:
-    """Effective date and createdate both tied; no recorded FT among them."""
-
-    company_id: str
-    effective_date: date
-    createdate: str
-    contact_ids: tuple[str, ...]
-    recorded_first_touch_contact_id: str
-
-
 @dataclass
 class CompanyPropertiesResult:
     profiles: dict[str, CompanyEventProfile]
-    zero_history_first_touch: list[ZeroHistoryFirstTouchContact] = field(
-        default_factory=list
-    )
-    undecided_first_touch_ties: list[UndecidedFirstTouchTie] = field(
-        default_factory=list
-    )
-
-
-def _select_first_touch_winner(
-    contacts: list[ContactEventData],
-    matched_events_by_contact: dict[str, list[str]],
-    date_lookup: dict[str, date],
-    registry_lead_sources: set[str],
-    lead_source_history_dates: dict[str, date],
-    company_id: str,
-    recorded_first_touch_contact_id: str = "",
-) -> tuple[
-    ContactEventData | None,
-    list[ZeroHistoryFirstTouchContact],
-    UndecidedFirstTouchTie | None,
-]:
-    """Earliest effective date wins; ties break on earliest createdate.
-
-    When effective date and createdate both tie (bulk-import siblings), prefer
-    the company's currently recorded First Touch Contact ID if it is among the
-    tied contacts. If none of them is the recorded winner, return no winner and
-    an UndecidedFirstTouchTie for manual review — do not pick arbitrarily.
-
-    Effective date:
-      - Lead Source is a registry value AND contact has matched events →
-        earliest registry Event Date among those events
-      - Lead Source filled but not a registry value → earliest non-empty
-        lead_source__deal_source history date (supplied by caller)
-      - Lead Source blank, or registry-LS with no events → does not compete
-      - Non-registry Lead Source with no usable history → excluded + reported
-    """
-    zero_history: list[ZeroHistoryFirstTouchContact] = []
-    # contact_id -> (effective_date, contact)
-    candidates: dict[str, tuple[date, ContactEventData]] = {}
-
-    for contact in contacts:
-        ls = (contact.lead_source or "").strip()
-        if not ls:
-            continue
-
-        if ls in registry_lead_sources:
-            events = matched_events_by_contact.get(contact.contact_id, [])
-            if not events:
-                continue
-            eff = min(date_lookup[name] for name in events)
-            candidates[contact.contact_id] = (eff, contact)
-            continue
-
-        # Case-2: non-registry Lead Source — history date required.
-        hist_date = lead_source_history_dates.get(contact.contact_id)
-        if hist_date is None:
-            zero_history.append(
-                ZeroHistoryFirstTouchContact(
-                    company_id=company_id,
-                    contact_id=contact.contact_id,
-                    lead_source=ls,
-                )
-            )
-            continue
-        candidates[contact.contact_id] = (hist_date, contact)
-
-    if not candidates:
-        return None, zero_history, None
-
-    best_date = min(eff for eff, _ in candidates.values())
-    contenders = [c for eff, c in candidates.values() if eff == best_date]
-    if len(contenders) == 1:
-        return contenders[0], zero_history, None
-
-    def createdate_key(contact: ContactEventData) -> datetime:
-        try:
-            return parse_contact_createdate(contact.createdate)
-        except ValueError as exc:
-            raise OngoingAggregationError(
-                f"Contact {contact.contact_id} is tied for earliest First Touch "
-                f"effective date ({best_date.isoformat()}) but has an unusable "
-                f"createdate ({contact.createdate!r}); cannot break the tie. "
-                f"{exc}"
-            ) from exc
-
-    best_createdate = min(createdate_key(c) for c in contenders)
-    createdate_tied = [
-        c for c in contenders if createdate_key(c) == best_createdate
-    ]
-    if len(createdate_tied) == 1:
-        return createdate_tied[0], zero_history, None
-
-    # Tertiary: identical effective date + createdate (bulk-import siblings).
-    recorded = (recorded_first_touch_contact_id or "").strip()
-    if recorded:
-        for contact in createdate_tied:
-            if contact.contact_id == recorded:
-                return contact, zero_history, None
-
-    tied_ids = tuple(sorted(c.contact_id for c in createdate_tied))
-    return (
-        None,
-        zero_history,
-        UndecidedFirstTouchTie(
-            company_id=company_id,
-            effective_date=best_date,
-            createdate=createdate_tied[0].createdate,
-            contact_ids=tied_ids,
-            recorded_first_touch_contact_id=recorded,
-        ),
-    )
 
 
 def compute_company_properties(
     contacts_by_company: dict[str, list[ContactEventData]],
     tier_lookup: dict[str, str],
-    date_lookup: dict[str, date] | None = None,
-    registry_lead_sources: set[str] | None = None,
-    lead_source_history_dates: dict[str, date] | None = None,
-    first_touch_contacts_by_company: dict[str, list[ContactEventData]] | None = None,
-    recorded_first_touch_by_company: dict[str, str] | None = None,
 ) -> CompanyPropertiesResult:
     """Roll Ops-maintained contact properties up to company property values.
 
@@ -369,45 +162,14 @@ def compute_company_properties(
                           get touched, never which contacts get counted once
                           a company is in scope.
     tier_lookup         : canonical_event -> "Channel" | "General"
-    date_lookup         : canonical_event -> date. Required for First Touch;
-                          when omitted, First Touch fields stay blank.
-    registry_lead_sources : Lead Source labels from the registry. Required for
-                          First Touch classification when date_lookup is set.
-    lead_source_history_dates : contact_id -> earliest non-empty LS history
-                          date, for non-registry Lead Source contacts only.
-    first_touch_contacts_by_company : optional extra contacts (e.g. non-event
-                          case-2) merged into the First Touch candidate pool
-                          only — never into Rules 1–3.
-    recorded_first_touch_by_company : company_id -> currently recorded
-                          first_touch_contact_id, used only as the tertiary
-                          tie-break when effective date and createdate both tie.
 
     Raises UnmatchedEventError if any event name is absent from tier_lookup.
     """
-    dates = date_lookup if date_lookup is not None else {}
-    reg_ls = registry_lead_sources if registry_lead_sources is not None else set()
-    history_dates = (
-        lead_source_history_dates if lead_source_history_dates is not None else {}
-    )
-    ft_extras = (
-        first_touch_contacts_by_company
-        if first_touch_contacts_by_company is not None
-        else {}
-    )
-    recorded_ft = (
-        recorded_first_touch_by_company
-        if recorded_first_touch_by_company is not None
-        else {}
-    )
-
     profiles: dict[str, CompanyEventProfile] = {}
     unmatched: list[UnmatchedEvent] = []
-    zero_history: list[ZeroHistoryFirstTouchContact] = []
-    undecided_ties: list[UndecidedFirstTouchTie] = []
 
     for company_id, contacts in contacts_by_company.items():
         profile = CompanyEventProfile(company_id)
-        matched_events_by_contact: dict[str, list[str]] = {}
         for contact in contacts:
             events = split_events(contact.events_attended)
             is_high_engagement = (
@@ -427,45 +189,12 @@ def compute_company_properties(
                     continue
                 profile.events.add(event_name)
                 profile.tiers.add(tier)
-                matched_events_by_contact.setdefault(contact.contact_id, []).append(
-                    event_name
-                )
-
-        if dates:
-            # First Touch pool = event-bearing contacts + any FT-only extras.
-            # Deduplicate by contact_id (extras must not override event rows).
-            by_id = {c.contact_id: c for c in contacts}
-            for extra in ft_extras.get(company_id, []):
-                by_id.setdefault(extra.contact_id, extra)
-            ft_contacts = list(by_id.values())
-            winner, zh, undecided = _select_first_touch_winner(
-                ft_contacts,
-                matched_events_by_contact,
-                dates,
-                reg_ls,
-                history_dates,
-                company_id,
-                recorded_first_touch_contact_id=recorded_ft.get(company_id, ""),
-            )
-            zero_history.extend(zh)
-            if undecided is not None:
-                undecided_ties.append(undecided)
-            if winner is not None:
-                profile.first_touch_contact_id = winner.contact_id
-                profile.first_touch_lead_source = winner.lead_source or ""
-                profile.first_touch_lead_source_description = (
-                    winner.lead_source_description or ""
-                )
 
         profiles[company_id] = profile
 
     if unmatched:
         raise UnmatchedEventError(unmatched)
-    return CompanyPropertiesResult(
-        profiles=profiles,
-        zero_history_first_touch=zero_history,
-        undecided_first_touch_ties=undecided_ties,
-    )
+    return CompanyPropertiesResult(profiles=profiles)
 
 
 # ---------------------------------------------------------------------------
@@ -557,94 +286,6 @@ def detect_regressions(
                     HIGH_ENGAGEMENT_FALSE,
                     "company is currently flagged high-engagement but no associated "
                     "contact has high_engagement_attendee=Yes",
-                )
-            )
-
-        if flags:
-            flagged[company_id] = flags
-
-    return flagged
-
-
-# ---------------------------------------------------------------------------
-# First Touch conflict flags
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class FirstTouchFlag:
-    company_id: str
-    kind: str  # "changed_winner" | "changed_lead_source"
-    existing_contact_id: str
-    computed_contact_id: str
-    existing_lead_source: str
-    computed_lead_source: str
-    existing_lead_source_description: str
-    computed_lead_source_description: str
-    reason: str
-
-
-def detect_first_touch_conflicts(
-    profiles: dict[str, CompanyEventProfile],
-    existing_properties: dict[str, dict],
-) -> dict[str, list[FirstTouchFlag]]:
-    """Withhold-and-flag when a fresh First Touch disagrees with HubSpot.
-
-    Same shape as detect_regressions(): compute fresh, compare to live values,
-    return only the companies that need a human. Callers withhold those
-    companies from the import CSV rather than overwriting First Touch fields.
-
-    Flags only fire when the company already has a First Touch Contact ID.
-    A blank existing ID means First Touch has never been set — write freely.
-    """
-    flagged: dict[str, list[FirstTouchFlag]] = {}
-
-    for company_id, profile in profiles.items():
-        current = existing_properties.get(company_id, {})
-        existing_id = (current.get(FIRST_TOUCH_CONTACT_ID) or "").strip()
-        if not existing_id:
-            continue
-
-        computed_id = (profile.first_touch_contact_id or "").strip()
-        existing_ls = current.get(FIRST_TOUCH_LEAD_SOURCE) or ""
-        existing_lsd = current.get(FIRST_TOUCH_LEAD_SOURCE_DESCRIPTION) or ""
-        computed_ls = profile.first_touch_lead_source or ""
-        computed_lsd = profile.first_touch_lead_source_description or ""
-        flags: list[FirstTouchFlag] = []
-
-        if computed_id != existing_id:
-            flags.append(
-                FirstTouchFlag(
-                    company_id=company_id,
-                    kind="changed_winner",
-                    existing_contact_id=existing_id,
-                    computed_contact_id=computed_id,
-                    existing_lead_source=existing_ls,
-                    computed_lead_source=computed_ls,
-                    existing_lead_source_description=existing_lsd,
-                    computed_lead_source_description=computed_lsd,
-                    reason=(
-                        f"computed First Touch contact {computed_id or '(none)'} "
-                        f"differs from recorded {existing_id}"
-                    ),
-                )
-            )
-        elif existing_ls != computed_ls or existing_lsd != computed_lsd:
-            flags.append(
-                FirstTouchFlag(
-                    company_id=company_id,
-                    kind="changed_lead_source",
-                    existing_contact_id=existing_id,
-                    computed_contact_id=computed_id,
-                    existing_lead_source=existing_ls,
-                    computed_lead_source=computed_ls,
-                    existing_lead_source_description=existing_lsd,
-                    computed_lead_source_description=computed_lsd,
-                    reason=(
-                        "same First Touch contact, but Lead Source and/or "
-                        "Lead Source Description differ from what is recorded "
-                        "on the company"
-                    ),
                 )
             )
 

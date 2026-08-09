@@ -56,33 +56,23 @@ ASSOCIATIONS_BATCH_LIMIT = 1000
 # Contact properties Ops maintains by hand. Internal names confirmed against the
 # live portal 2026-08-04: events_attended is a string/textarea,
 # high_engagement_attendee is an enumeration with options Yes / No.
-# lead_source__deal_source / lead_source_description are also Ops-manual and
-# permanently read-only for this project — First Touch copies them onto the
-# company, never writes them back onto the contact.
 CONTACT_EVENTS_PROPERTY = "events_attended"
 CONTACT_HIGH_ENGAGEMENT_PROPERTY = "high_engagement_attendee"
-CONTACT_LEAD_SOURCE_PROPERTY = "lead_source__deal_source"
-CONTACT_LEAD_SOURCE_DESCRIPTION_PROPERTY = "lead_source_description"
-CONTACT_CREATEDATE_PROPERTY = "createdate"
 
 # The contact property that actually tracks record-level modification in this
 # portal. See search_contacts_modified_since() — hs_lastmodifieddate is empty on
 # contacts here and silently matches nothing.
 CONTACT_MODIFIED_PROPERTY = "lastmodifieddate"
 
-# The six company properties this project maintains. Single source of truth for
+# The three company properties this project maintains. Single source of truth for
 # search filters and for the batch-read that powers tripwires / CSV columns.
 # Value shapes (confirmed live portal 2026-08-04): marketing_event_type is a
 # multi-checkbox stored ";"-delimited with no space; distinct count is a number;
-# high_engagement_event_attendee is true/false; First Touch fields are direct
-# copies of the winning contact's Lead Source / Lead Source Description / id.
+# high_engagement_event_attendee is true/false.
 COMPANY_EVENT_PROPERTIES = [
     "marketing_event_type",
     "distinct_marketing_events_attended",
     "high_engagement_event_attendee",
-    "first_touch_lead_source",
-    "first_touch_lead_source_description",
-    "first_touch_contact_id",
 ]
 
 # Batch-read shape for in-scope companies: identity fields + event properties.
@@ -711,46 +701,4 @@ class HubSpotClient:
                 raise HubSpotError(
                     f"company->contact association batch error: {unexpected[0]!r}"
                 )
-        return out
-
-    def batch_read_contact_property_history(
-        self,
-        contact_ids: list[str],
-        property_name: str,
-        progress_label: str = "reading contact property history",
-    ) -> dict[str, list[dict]]:
-        """propertiesWithHistory for one property, keyed by contact ID.
-
-        Returns the history list HubSpot sends (newest-first). Contacts with
-        no history for the property get an empty list. Batch size 50 — history
-        payloads are larger than plain property reads.
-        """
-        history_batch = 50
-        out: dict[str, list[dict]] = {}
-        unique_ids = sorted(set(contact_ids))
-        if not unique_ids:
-            return out
-        total_batches = (len(unique_ids) + history_batch - 1) // history_batch
-        for batch_num, i in enumerate(range(0, len(unique_ids), history_batch), start=1):
-            chunk = unique_ids[i : i + history_batch]
-            print(
-                f"  {progress_label}, batch {batch_num}/{total_batches} "
-                f"({len(chunk)} contacts)..."
-            )
-            data = self._request(
-                "POST",
-                "/crm/v3/objects/contacts/batch/read",
-                json={
-                    "properties": [property_name],
-                    "propertiesWithHistory": [property_name],
-                    "inputs": [{"id": cid} for cid in chunk],
-                },
-            )
-            for row in data.get("results", []):
-                cid = str(row.get("id"))
-                pwh = row.get("propertiesWithHistory") or {}
-                entries = pwh.get(property_name)
-                out[cid] = list(entries) if isinstance(entries, list) else []
-            for cid in chunk:
-                out.setdefault(cid, [])
         return out

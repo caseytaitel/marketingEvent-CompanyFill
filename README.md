@@ -1,7 +1,7 @@
 # Marketing Event Data Fill
 
 Ongoing rollup: after each marketing event, Ops fills contact properties by
-hand, then runs this to recompute six **Company** properties and write a CSV
+hand, then runs this to recompute three **Company** properties and write a CSV
 for manual review and import.
 
 A one-time historical backfill originally seeded this data from HubSpot List
@@ -16,9 +16,6 @@ properties stay permanently read-only here; keeping them current is Ops's job (s
 | Distinct Marketing Events Attended | `distinct_marketing_events_attended` | Integer count of distinct canonical event names |
 | Marketing Event Type | `marketing_event_type` | Checkbox long labels `"Channel Event Attendee"` and/or `"General Marketing Event Attendee"`; semicolon-delimited with **no space** when both |
 | High Engagement Attendee | `high_engagement_event_attendee` | `"true"` / `"false"` |
-| First Touch Lead Source | `first_touch_lead_source` | Direct copy of the winning contact's `lead_source__deal_source` |
-| First Touch Lead Source Description | `first_touch_lead_source_description` | Direct copy of the winning contact's `lead_source_description` |
-| First Touch Contact ID | `first_touch_contact_id` | Winning contact's HubSpot ID |
 
 ---
 
@@ -28,8 +25,6 @@ properties stay permanently read-only here; keeping them current is Ops's job (s
 |---|---|---|
 | Events Attended | `events_attended` | `"; "`-delimited canonical event names |
 | High Engagement Attendee | `high_engagement_attendee` | `Yes` / `No` |
-| Lead Source | `lead_source__deal_source` | Copied onto company First Touch when this contact wins |
-| Lead Source Description | `lead_source_description` | Same |
 
 None of these are ever written by this project.
 
@@ -38,7 +33,7 @@ None of these are ever written by this project.
 ## Registry contract
 
 Runtime source of truth: `ongoing_events/input/marketingEventsRegistry.csv`,
-loaded by `ongoing_events/registry.py`. Code reads exactly four columns;
+loaded by `ongoing_events/registry.py`. Code reads exactly three columns;
 everything else is Ops reference only.
 
 | Column | Used by code? | Purpose |
@@ -49,18 +44,17 @@ everything else is Ops reference only.
 | List ID | No | Historical reference |
 | **Events Attended Appendage** | **Yes — lookup key** | Exact string Ops types into a contact's Events Attended |
 | **Event Type** | **Yes** | `Channel` or `General` (mapped to the long checkbox labels above) |
-| **Event Date** | **Yes** | Earliest-event ordering for First Touch |
-| Lead Source | **Yes — membership check only** | Used to classify a contact's own Lead Source as registry-backed vs. not, for First Touch's effective-date logic. Never copied onto anything — the value written to a company always comes from the winning contact's own fields. |
+| **Event Date** | **Yes** | Calendar date for the event |
+| Lead Source | No | Ops still fills this by hand; unused by code |
 | Lead Source Description | No | Ops reference when filling the contact's Lead Source Description by hand |
 
 `Events Attended Appendage` and `Lead Source Description` are often identical
 today — do not assume they always will be. Lookups use the appendage column
-for identity; Lead Source is read separately, for membership-checking only,
-never for its value.
+for identity.
 
 ---
 
-## How the six properties are computed
+## How the three properties are computed
 
 Every in-scope company is a **full recompute** from all of its event-bearing
 contacts. The date flag decides which companies get touched, never which
@@ -74,32 +68,6 @@ contacts get counted once a company is in scope.
    written).
 3. **High Engagement Attendee** — `"true"` if any contact has
    `high_engagement_attendee=Yes`, else `"false"` (never left blank).
-4. **First Touch** — every contact at the company with a Lead Source gets an
-   *effective date*, then the earliest wins (ties break on earliest contact
-   `createdate`). If effective date and createdate are both tied — which happens when two contacts were created in the same bulk import, sharing an identical timestamp — prefer whichever contact is already the company's recorded First Touch Contact ID, if either one is. There's no real signal distinguishing bulk-import siblings from each other; this avoids arbitrarily flipping between them. Copy that winner's own Lead Source, Lead Source Description,
-   and contact ID onto the three company First Touch fields — never a registry
-   lookup for those values.
-   - Lead Source matches a registry Lead Source label **and** the contact has
-     events attended → effective date = earliest registry Event Date among
-     their events.
-   - Lead Source is filled but **not** a registry label (referral, sales
-     outreach, etc.) → effective date = when that Lead Source was first set,
-     from HubSpot property history (oldest non-empty revision).
-   - Lead Source blank → does not compete.
-
-   **Limitations Ops should know:**
-   - HubSpot only keeps a limited number of property-history revisions (about
-     45). If a contact's Lead Source has been changed more times than that,
-     the oldest revision we can see may not be the true first set — First
-     Touch could pick a later date than reality for that contact.
-   - If Lead Source was bulk-cleared or rewritten in a cleanup pass, the
-     "first set" timestamp may reflect that cleanup rather than the original
-     first touch. Treat odd First Touch winners after a cleanup as a signal
-     to spot-check history in HubSpot.
-   - If a contact has a non-event Lead Source filled in but HubSpot's property
-     history returns no usable "first set" date for it, that contact is left
-     out of First Touch for the run and listed in the review report — not
-     silently skipped, and not treated as if they had no date.
 
 Realm itself is excluded by domain (`realm.security`) so employee attendance
 never tiers Realm as a target account. That exclusion applies to both output
@@ -153,8 +121,8 @@ Three files land in `ongoing_events/output/YYYY-MM-DD/`:
 
 | File | Contents |
 |---|---|
-| `marketing_event_company_ongoing_fill.csv` | Import-ready rows (six company properties) |
-| `withheld_companies_review.csv` | Same shape as the main CSV plus `flag_reason` — one full computed row per company withheld for a regression, First Touch conflict, or undecided tertiary tie (mutually exclusive with the main CSV) |
+| `marketing_event_company_ongoing_fill.csv` | Import-ready rows (three company properties) |
+| `withheld_companies_review.csv` | Same shape as the main CSV plus `flag_reason` — one full computed row per company withheld for a regression (mutually exclusive with the main CSV) |
 | `ongoing_review_report.md` | Run summary plus findings that are not company rows in the withheld CSV |
 
 A second run on the same calendar day overwrites that day's folder. Copy or
@@ -172,20 +140,18 @@ review report has findings.
    invisible at company level until someone fixes the association.
 3. **Companies holding event properties with no event-bearing contacts.**
    Nothing recomputes these, so nothing watches them.
-4. **First Touch: Lead Source set but no usable property history.** Contact
-   left out of First Touch for the run — not silently skipped.
-5. **Volume sanity check.** Warns when a scoped run touches most of the portal.
+4. **Volume sanity check.** Warns when a scoped run touches most of the portal.
 
-Regressions, First Touch conflicts, and undecided tertiary ties are **not**
-listed in the review report — open `withheld_companies_review.csv` (each row's
-`flag_reason` explains why it was withheld).
+Regressions are **not** listed in the review report — open
+`withheld_companies_review.csv` (each row's `flag_reason` explains why it was
+withheld).
 
 ### After the run
 
 1. Open the review report for non-CSV findings, and
    `withheld_companies_review.csv` for withheld company rows.
 2. Spot-check a handful of companies in the CSV against HubSpot.
-3. Import the CSV, mapping the six company properties. Multi-checkbox values
+3. Import the CSV, mapping the three company properties. Multi-checkbox values
    are semicolon-delimited with no space — confirm that in the import preview.
    Skip review-only columns (`company_name`, `company_domain`,
    `distinct_events_attended`).
@@ -206,7 +172,6 @@ listed in the review report — open `withheld_companies_review.csv` (each row's
   all" to keep the blast radius down.
 - Company `high_engagement_event_attendee` is `"true"`/`"false"`; contact
   `high_engagement_attendee` is `Yes`/`No`.
-- First Touch's non-registry-Lead-Source candidates require checking every contact at a company, not just event-bearing ones. Finding whether anyone at a company has a real, non-event Lead Source (referral, sales outreach) that might win First Touch means resolving primary-company association for every contact tied to each in-scope company — not just the ~2,600 with event data. A full --all-time run resolved primary company for roughly 12,000 contacts as a result, plus ~34 batched property-history lookups. Expected, not a bug — but budget for it before you're surprised by run time.
 
 ---
 
@@ -231,9 +196,8 @@ Data flow:
 date_scope flags
     → contact search (lastmodifieddate + has event data)
     → resolve_primary_companies()           # universe → in-scope companies
-    → First Touch extras (non-event contacts at those companies)
     → compute_company_properties()          # pure, no API; full recompute
-    → detect_regressions() / detect_first_touch_conflicts()
+    → detect_regressions()
     → main CSV + withheld CSV + review report
 ```
 
@@ -275,6 +239,6 @@ label `"Primary"` (not hardcoded). Escape hatch:
 
 **Fatal error types** (caught at the top of `company_fill.py`):
 `HubSpotError` (API), `RegistryError` (registry CSV), and
-`OngoingAggregationError` (rules hard-stops such as unbreakable First Touch
-ties). Unmatched event names are `UnmatchedEventError` (a rules subclass) and
-exit `1` with a review report and no CSV.
+`OngoingAggregationError` (rules hard-stops). Unmatched event names are
+`UnmatchedEventError` (a rules subclass) and exit `1` with a review report
+and no CSV.
