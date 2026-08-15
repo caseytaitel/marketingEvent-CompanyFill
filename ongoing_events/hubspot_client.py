@@ -64,15 +64,19 @@ CONTACT_HIGH_ENGAGEMENT_PROPERTY = "high_engagement_attendee"
 # contacts here and silently matches nothing.
 CONTACT_MODIFIED_PROPERTY = "lastmodifieddate"
 
-# The three company properties this project maintains. Single source of truth for
+# The four company properties this project maintains. Single source of truth for
 # search filters and for the batch-read that powers tripwires / CSV columns.
-# Value shapes (confirmed live portal 2026-08-04): marketing_event_type is a
+# Value shapes (confirmed live portal 2026-08-04 for the original three;
+# events_attended matches the contact-side convention): marketing_event_type is a
 # multi-checkbox stored ";"-delimited with no space; distinct count is a number;
-# high_engagement_event_attendee is true/false.
+# high_engagement_event_attendee is true/false; events_attended is a textarea
+# stored "; "-delimited (semicolon + space).
+COMPANY_EVENTS_PROPERTY = "events_attended"
 COMPANY_EVENT_PROPERTIES = [
     "marketing_event_type",
     "distinct_marketing_events_attended",
     "high_engagement_event_attendee",
+    COMPANY_EVENTS_PROPERTY,
 ]
 
 # Batch-read shape for in-scope companies: identity fields + event properties.
@@ -366,8 +370,9 @@ class HubSpotClient:
         # HAS_PROPERTY is wrong for the number/bool fields — a written 0 / false
         # still "has" a value (verified 2026-08-05 on the 22 zeroed companies:
         # high_engagement_event_attendee="false" matched HAS_PROPERTY). For
-        # marketing_event_type (multi-checkbox), a cleared "" is treated as
-        # absent — HAS_PROPERTY returns false — so that operator is correct.
+        # marketing_event_type (multi-checkbox) and events_attended (textarea),
+        # a cleared "" is treated as absent — HAS_PROPERTY returns false — so
+        # that operator is correct for both.
         filter_groups = [
             {
                 "filters": [
@@ -391,6 +396,14 @@ class HubSpotClient:
                 "filters": [
                     {
                         "propertyName": "marketing_event_type",
+                        "operator": "HAS_PROPERTY",
+                    }
+                ]
+            },
+            {
+                "filters": [
+                    {
+                        "propertyName": COMPANY_EVENTS_PROPERTY,
                         "operator": "HAS_PROPERTY",
                     }
                 ]

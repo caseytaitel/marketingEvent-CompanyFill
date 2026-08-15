@@ -285,6 +285,28 @@ def test_main_and_withheld_csv_ids_never_overlap() -> None:
     assert main_ids.isdisjoint(withheld_ids)
 
 
+def test_main_csv_events_attended_matches_profile_property() -> None:
+    profile = _profile(
+        "OK",
+        events={
+            "Gamma Con - BOS - 03/03/26",
+            "Alpha Summit - NYC - 01/01/26",
+        },
+    )
+    companies = {"OK": {"name": "Ok Co", "domain": "ok.example"}}
+    report = _report()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        main_path = Path(tmp) / "main.csv"
+        write_company_csv(
+            {"OK": profile}, companies, set(), set(), main_path, report
+        )
+        rows = _read_csv(main_path)
+
+    assert len(rows) == 1
+    assert rows[0]["events_attended"] == profile.events_attended
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failures = 0

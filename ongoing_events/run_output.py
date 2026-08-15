@@ -47,7 +47,7 @@ MAIN_CSV_FIELDNAMES = [
     "marketing_event_type",
     "distinct_marketing_events_attended",
     "high_engagement_event_attendee",
-    "distinct_events_attended",
+    "events_attended",
 ]
 
 WITHHELD_CSV_FIELDNAMES = MAIN_CSV_FIELDNAMES + ["flag_reason"]
@@ -130,10 +130,7 @@ def _company_csv_row(
             profile.distinct_marketing_events_attended
         ),
         "high_engagement_event_attendee": profile.high_engagement_event_attendee,
-        # Audit trail only — not a company property. Uses "; " for
-        # readability; the property columns above use the portal's exact
-        # ";" form.
-        "distinct_events_attended": "; ".join(sorted(profile.events)),
+        "events_attended": profile.events_attended,
     }
 
 
@@ -390,13 +387,14 @@ def write_review_report(
             "its properties by hand."
         )
         add("")
-        add("| Company | Name | Distinct events | Marketing event type | High engagement |")
-        add("|---|---|---|---|---|")
+        add("| Company | Name | Distinct events | Events attended | Marketing event type | High engagement |")
+        add("|---|---|---|---|---|---|")
         for company_id, props in sorted(report.stranded_companies.items()):
             add(
                 f"| {_company_link(report.portal_id, company_id)} | "
                 f"{props.get('name') or '(no name)'} | "
                 f"{props.get('distinct_marketing_events_attended') or ''} | "
+                f"{props.get('events_attended') or ''} | "
                 f"{props.get('marketing_event_type') or ''} | "
                 f"{props.get('high_engagement_event_attendee') or ''} |"
             )

@@ -2,16 +2,19 @@
 """
 Ongoing marketing-event company fill — orchestrator.
 
-Keeps three Company properties current as Ops adds new events and fills in
+Keeps four Company properties current as Ops adds new events and fills in
 contact properties:
 
     marketing_event_type
     distinct_marketing_events_attended
     high_engagement_event_attendee
+    events_attended
 
 Inputs are contact properties Ops maintains by hand — events_attended and
 high_engagement_attendee. This script never writes to those contact
-properties: keeping them current is permanently Ops's job.
+properties: keeping them current is permanently Ops's job. Company
+events_attended is an output; contact events_attended is the Ops-maintained
+input.
 
 Output is CSV for manual review + import. No write-back, no scheduling —
 Ops runs this by hand after each event. Every run is a full recompute for

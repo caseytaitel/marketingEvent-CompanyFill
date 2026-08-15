@@ -9,9 +9,13 @@ Input is the contact properties Ops maintains by hand (read-only here):
   events_attended              free-text, "; "-delimited canonical event names
   high_engagement_attendee     "Yes" / "No" / blank
 
-Output is the three company properties, already in the exact string form the
+Output is the four company properties, already in the exact string form the
 HubSpot property options use, so a CSV cell can be compared byte-for-byte
-against what the portal currently holds.
+against what the portal currently holds:
+  distinct_marketing_events_attended  integer count of unique names
+  events_attended                     "; "-joined sorted canonical names
+  marketing_event_type                checkbox labels, ";"-delimited (no space)
+  high_engagement_event_attendee      "true" / "false"
 """
 
 from __future__ import annotations
@@ -111,7 +115,7 @@ class UnmatchedEventError(OngoingAggregationError):
 
 @dataclass
 class CompanyEventProfile:
-    """The three company property values, plus the audit trail behind them."""
+    """The four company property values, plus the audit trail behind them."""
 
     company_id: str
     events: set[str] = field(default_factory=set)
@@ -122,6 +126,10 @@ class CompanyEventProfile:
     @property
     def distinct_marketing_events_attended(self) -> int:
         return len(self.events)
+
+    @property
+    def events_attended(self) -> str:
+        return "; ".join(sorted(self.events))
 
     @property
     def marketing_event_type(self) -> str:
@@ -224,7 +232,7 @@ def detect_regressions(
 ) -> dict[str, list[RegressionFlag]]:
     """Find companies whose freshly computed values are WORSE than HubSpot's.
 
-    These three properties should only ever grow. A shrink is far more often a
+    These four properties should only ever grow. A shrink is far more often a
     deleted contact, a broken association, or a mid-run permission problem than
     a legitimate data change, so a shrinking company is flagged for a human and
     withheld from the import CSV rather than overwritten.
@@ -251,6 +259,20 @@ def detect_regressions(
                     str(existing_count),
                     str(computed_count),
                     f"count dropped by {existing_count - computed_count}",
+                )
+            )
+
+        existing_names = set(split_events(current.get("events_attended") or ""))
+        lost_events = existing_names - profile.events
+        if lost_events:
+            flags.append(
+                RegressionFlag(
+                    company_id,
+                    "events_attended",
+                    "; ".join(sorted(existing_names)),
+                    profile.events_attended,
+                    "previously-set event disappeared: "
+                    + ", ".join(sorted(lost_events)),
                 )
             )
 

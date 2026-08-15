@@ -1,7 +1,7 @@
 # Marketing Event Data Fill
 
 Ongoing rollup: after each marketing event, Ops fills contact properties by
-hand, then runs this to recompute three **Company** properties and write a CSV
+hand, then runs this to recompute four **Company** properties and write a CSV
 for manual review and import.
 
 A one-time historical backfill originally seeded this data from HubSpot List
@@ -14,6 +14,7 @@ properties stay permanently read-only here; keeping them current is Ops's job (s
 | Company property | Internal name | Value shape |
 |---|---|---|
 | Distinct Marketing Events Attended | `distinct_marketing_events_attended` | Integer count of distinct canonical event names |
+| Events Attended | `events_attended` | `"; "`-delimited sorted canonical event names |
 | Marketing Event Type | `marketing_event_type` | Checkbox long labels `"Channel Event Attendee"` and/or `"General Marketing Event Attendee"`; semicolon-delimited with **no space** when both |
 | High Engagement Attendee | `high_engagement_event_attendee` | `"true"` / `"false"` |
 
@@ -54,7 +55,7 @@ for identity.
 
 ---
 
-## How the three properties are computed
+## How the four properties are computed
 
 Every in-scope company is a **full recompute** from all of its event-bearing
 contacts. The date flag decides which companies get touched, never which
@@ -62,11 +63,13 @@ contacts get counted once a company is in scope.
 
 1. **Distinct Marketing Events Attended** — union of every event name on those
    contacts; count of unique names.
-2. **Marketing Event Type** — look each distinct name up in the registry; set
+2. **Events Attended** — the same union; sorted unique names joined with
+   `"; "`.
+3. **Marketing Event Type** — look each distinct name up in the registry; set
    Channel and/or General checkbox labels as above. Any name missing from the
    registry is a **hard stop** (contact, company, and string reported; nothing
    written).
-3. **High Engagement Attendee** — `"true"` if any contact has
+4. **High Engagement Attendee** — `"true"` if any contact has
    `high_engagement_attendee=Yes`, else `"false"` (never left blank).
 
 Realm itself is excluded by domain (`realm.security`) so employee attendance
@@ -125,7 +128,7 @@ comparison.
 
 | File | Contents |
 |---|---|
-| `marketing_event_company_ongoing_fill.csv` | Import-ready rows (three company properties) |
+| `marketing_event_company_ongoing_fill.csv` | Import-ready rows (four company properties) |
 | `withheld_companies_review.csv` | Same shape as the main CSV plus `flag_reason` — one full computed row per company withheld for a regression (mutually exclusive with the main CSV). **Only written when at least one company is withheld**; otherwise omitted. |
 | `ongoing_review_report.md` | Run summary plus findings that are not company rows in the withheld CSV |
 
@@ -152,14 +155,14 @@ explains why it was withheld).
 1. Open the review report for non-CSV findings, and
    `withheld_companies_review.csv` for withheld company rows (if present).
 2. Spot-check a handful of companies in the CSV against HubSpot.
-3. Import the CSV, mapping the three company properties. Multi-checkbox values
-   are semicolon-delimited with no space — confirm that in the import preview.
-   Skip review-only columns (`company_name`, `company_domain`,
-   `distinct_events_attended`).
+3. Import the CSV, mapping the company properties (including `events_attended`).
+   Multi-checkbox values are semicolon-delimited with no space — confirm that
+   in the import preview. Skip review-only columns (`company_name`,
+   `company_domain`).
 4. For withheld companies: open `withheld_companies_review.csv`, delete the
    rows you're not ready to accept, and import what's left with the same
-   property mapping as the main CSV (`flag_reason` and
-   `distinct_events_attended` are review-only — skip them on import).
+   property mapping as the main CSV (`flag_reason` is review-only — skip it
+   on import).
 
 ---
 
@@ -173,6 +176,11 @@ explains why it was withheld).
   all" to keep the blast radius down.
 - Company `high_engagement_event_attendee` is `"true"`/`"false"`; contact
   `high_engagement_attendee` is `Yes`/`No`.
+- Company `events_attended` uses `"; "` (semicolon + space), like the contact
+  property; `marketing_event_type` still uses `";"` with **no** space. The
+  internal name `events_attended` exists on both contact and company: this
+  project writes the company one (via CSV import) and only reads the contact
+  one.
 
 ---
 

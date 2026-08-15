@@ -115,6 +115,7 @@ def test_high_engagement_without_any_named_event() -> None:
     p = profiles["C1"]
     assert p.high_engagement_event_attendee == "true"
     assert p.distinct_marketing_events_attended == 0
+    assert p.events_attended == ""
     assert p.marketing_event_type == ""
     assert p.contributing_contacts == ["p1"]
 
@@ -206,12 +207,95 @@ def test_growth_is_not_a_regression() -> None:
         {
             "C1": {
                 "distinct_marketing_events_attended": "1",
+                "events_attended": "Alpha Summit - NYC - 01/01/26",
                 "marketing_event_type": "General Marketing Event Attendee",
                 "high_engagement_event_attendee": "false",
             }
         },
     )
     assert flagged == {}
+
+
+def test_events_attended_formats_sorted_join() -> None:
+    profiles = compute_company_properties(
+        {
+            "C1": [
+                ContactEventData(
+                    "p1",
+                    "Gamma Con - BOS - 03/03/26; Alpha Summit - NYC - 01/01/26",
+                )
+            ]
+        },
+        TIERS,
+    )
+    assert profiles["C1"].events_attended == (
+        "Alpha Summit - NYC - 01/01/26; Gamma Con - BOS - 03/03/26"
+    )
+
+
+def test_regression_flags_disappearing_event() -> None:
+    profiles = compute_company_properties(
+        {"C1": [ContactEventData("p1", "Alpha Summit - NYC - 01/01/26")]}, TIERS
+    )
+    flagged = detect_regressions(
+        profiles,
+        {
+            "C1": {
+                "events_attended": (
+                    "Alpha Summit - NYC - 01/01/26; "
+                    "Beta Partner Dinner - ATL - 02/02/26"
+                ),
+            }
+        },
+    )
+    event_flags = [f for f in flagged["C1"] if f.property_name == "events_attended"]
+    assert len(event_flags) == 1
+    assert "Beta Partner Dinner - ATL - 02/02/26" in event_flags[0].reason
+
+
+def test_regression_order_or_delimiter_only_is_not_a_regression() -> None:
+    profiles = compute_company_properties(
+        {
+            "C1": [
+                ContactEventData(
+                    "p1",
+                    "Alpha Summit - NYC - 01/01/26; Gamma Con - BOS - 03/03/26",
+                )
+            ]
+        },
+        TIERS,
+    )
+    flagged = detect_regressions(
+        profiles,
+        {
+            "C1": {
+                "events_attended": (
+                    "Gamma Con - BOS - 03/03/26;Alpha Summit - NYC - 01/01/26"
+                ),
+            }
+        },
+    )
+    event_flags = [
+        f
+        for flags in flagged.values()
+        for f in flags
+        if f.property_name == "events_attended"
+    ]
+    assert event_flags == []
+
+
+def test_regression_replaced_event_same_count() -> None:
+    profiles = compute_company_properties(
+        {"C1": [ContactEventData("p1", "Alpha Summit - NYC - 01/01/26")]}, TIERS
+    )
+    flagged = detect_regressions(
+        profiles,
+        {"C1": {"events_attended": "Gamma Con - BOS - 03/03/26"}},
+    )
+    assert "C1" in flagged
+    names = [f.property_name for f in flagged["C1"]]
+    assert "events_attended" in names
+    assert "distinct_marketing_events_attended" not in names
 
 
 def test_company_absent_from_hubspot_is_not_a_regression() -> None:
