@@ -7,9 +7,7 @@ for manual review and import.
 A one-time historical backfill originally seeded this data from HubSpot List
 membership; that tooling has been removed — see git history if you need it.
 
-**This project never writes to HubSpot.** Output is CSV-only on purpose. You
-spot-check the file, then import it via HubSpot's import tool. Contact
-properties stay permanently read-only here; keeping them current is Ops's job (see What Ops maintains below).
+**This project does not write to HubSpot.** Output is CSV-only. Spot-check the file, then import it via HubSpot's import tool. 
 
 | Company property | Internal name | Value shape |
 |---|---|---|
@@ -26,8 +24,6 @@ properties stay permanently read-only here; keeping them current is Ops's job (s
 |---|---|---|
 | Events Attended | `events_attended` | `"; "`-delimited canonical event names |
 | High Engagement Attendee | `high_engagement_attendee` | `Yes` / `No` |
-
-None of these are ever written by this project.
 
 ---
 
@@ -49,17 +45,12 @@ everything else is Ops reference only.
 | Lead Source | No | Ops still fills this by hand; unused by code |
 | Lead Source Description | No | Ops reference when filling the contact's Lead Source Description by hand |
 
-`Events Attended Appendage` and `Lead Source Description` are often identical
-today — do not assume they always will be. Lookups use the appendage column
-for identity.
-
 ---
 
 ## How the four properties are computed
 
 Every in-scope company is a **full recompute** from all of its event-bearing
-contacts. The date flag decides which companies get touched, never which
-contacts get counted once a company is in scope.
+contacts. 
 
 1. **Distinct Marketing Events Attended** — union of every event name on those
    contacts; count of unique names.
@@ -72,8 +63,7 @@ contacts get counted once a company is in scope.
 4. **High Engagement Attendee** — `"true"` if any contact has
    `high_engagement_attendee=Yes`, else `"false"` (never left blank).
 
-Realm itself is excluded by domain (`realm.security`) so employee attendance
-never tiers Realm as a target account. That exclusion applies to both output
+Realm itself is excluded by domain (`realm.security`) in both output
 CSVs — the main import file and `withheld_companies_review.csv`.
 
 ---
@@ -188,7 +178,7 @@ explains why it was withheld).
 
 | Path | Role |
 |---|---|
-| `ongoing_events/company_fill.py` | Orchestrator — sequences the run, no business math |
+| `ongoing_events/company_fill.py` | Orchestrator — sequences the run |
 | `ongoing_events/date_scope.py` | CLI date flags / fiscal window; shared Ops date parsing (no API) |
 | `ongoing_events/company_rules.py` | Company rules — pure, no API (`OngoingAggregationError`) |
 | `ongoing_events/registry.py` | Registry load, lookups, `EXCLUDED_COMPANY_DOMAINS` (`RegistryError`) |
